@@ -1,14 +1,21 @@
 import 'dart:async';
-import 'package:asng/register/view/register_view.dart' show RegisterView;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'presensi_view.dart';
+import 'register/view/register_view.dart';
+import 'settings/settings_view.dart';
+import 'services/api_service.dart';
 
 late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   cameras = await availableCameras();
+  
+  // Kirim heartbeat ke server di background
+  ApiService.sendHeartbeat();
+
   runApp(MyApp(cameras: cameras));
 }
 
@@ -38,53 +45,66 @@ class MyHomePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Stack(
-        children: [
-          // Background image
-          Positioned.fill(
-            child: Image.asset(
-              'assets/images/bgnew.jpg', // pastikan gambar ini ada di pubspec.yaml
-              fit: BoxFit.cover,
-            ),
-          ),
-          // Content overlay
-          Positioned.fill(
-            child: Container(
-              color: Colors.black.withOpacity(0.3), // Optional dark overlay
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  const Text(
-                    'Sistem Presensi Untuk ASN Kab Tangerang',
-                    textAlign: TextAlign.center,
-                    style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 40),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 20),
-                    child: GridView.count(
-                      crossAxisCount: 2,
-                      shrinkWrap: true,
-                      mainAxisSpacing: 20,
-                      crossAxisSpacing: 20,
-                      children: [
-                        _buildButton(context, Icons.fingerprint, 'Presensi'),
-                        _buildButton(context, Icons.app_registration, 'Register'),
-                        _buildButton(context, Icons.person, 'User List'),
-                        _buildButton(context, Icons.logout, 'Logout'),
-                      ],
-                    ),
-                  ),
-                ],
+    // Step 10: Block back button on home screen (kiosk mode)
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        body: Stack(
+          children: [
+            // Background image
+            Positioned.fill(
+              child: Image.asset(
+                'assets/images/bgnew.jpg',
+                fit: BoxFit.cover,
               ),
             ),
-          ),
-        ],
+            // Content overlay
+            Positioned.fill(
+              child: Container(
+                color: Colors.black.withValues(alpha: 0.3),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // Step 2: Long-press on title to access hidden Settings
+                    GestureDetector(
+                      onLongPress: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => const SettingsView()),
+                        );
+                      },
+                      child: const Text(
+                        'Sistem Presensi Untuk ASN\nKab Tangerang',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          fontSize: 24,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.white,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 40),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 20),
+                      child: GridView.count(
+                        crossAxisCount: 2,
+                        shrinkWrap: true,
+                        mainAxisSpacing: 20,
+                        crossAxisSpacing: 20,
+                        children: [
+                          _buildButton(context, Icons.fingerprint, 'Presensi'),
+                          _buildButton(context, Icons.app_registration, 'Register'),
+                          _buildButton(context, Icons.settings, 'Settings'),
+                          _buildButton(context, Icons.logout, 'Logout'),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -92,7 +112,7 @@ class MyHomePage extends StatelessWidget {
   Widget _buildButton(BuildContext context, IconData icon, String label) {
     return ElevatedButton(
       style: ElevatedButton.styleFrom(
-        backgroundColor: Colors.white.withOpacity(0.8),
+        backgroundColor: Colors.white.withValues(alpha: 0.8),
         foregroundColor: Colors.black,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         padding: const EdgeInsets.all(16),
@@ -101,16 +121,17 @@ class MyHomePage extends StatelessWidget {
         if (label == 'Presensi') {
           Navigator.push(
             context,
-            MaterialPageRoute(builder: (context) => PresensiView()),
+            MaterialPageRoute(builder: (context) => const PresensiView()),
           );
         } else if (label == 'Register') {
           Navigator.push(
             context,
-              MaterialPageRoute(builder: (context) => RegisterView(cameras: cameras))
+            MaterialPageRoute(builder: (context) => RegisterView(cameras: cameras)),
           );
-        } else if (label == 'User List') {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Fitur belum tersedia')),
+        } else if (label == 'Settings') {
+          Navigator.push(
+            context,
+            MaterialPageRoute(builder: (_) => const SettingsView()),
           );
         } else if (label == 'Logout') {
           showDialog(
@@ -125,10 +146,8 @@ class MyHomePage extends StatelessWidget {
                 ),
                 ElevatedButton(
                   onPressed: () {
-                    Navigator.pop(context); // tutup dialog
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Berhasil logout')),
-                    );
+                    Navigator.pop(context);
+                    SystemNavigator.pop();
                   },
                   child: const Text('Logout'),
                 ),
