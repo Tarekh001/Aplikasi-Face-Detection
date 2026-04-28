@@ -14,7 +14,7 @@ class AppConfig {
 
   // ── Endpoint Constants ──
   static const String predictEndpoint = '/api/predict';
-  static const String registerEndpoint = '/api/register';
+  static const String registerEndpoint = '/api/register/mobile';
 
   // ── Getters ──
 

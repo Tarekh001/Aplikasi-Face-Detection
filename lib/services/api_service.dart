@@ -78,6 +78,8 @@ class ApiService {
   /// Sends multipart/form-data with:
   ///   - `name`: employee full name
   ///   - `nip`: 18-digit NIP
+  ///   - `opd_id`: the selected OPD/Instansi ID
+  ///   - `source`: 'mobile' (triggers pending approval on backend)
   ///   - `photos`: list of face photo files
   ///
   /// Returns the response data map on success.
@@ -85,14 +87,19 @@ class ApiService {
   static Future<Map<String, dynamic>> registerUser({
     required String name,
     required String nip,
+    required int opdId,
     required List<File> photos,
   }) async {
     try {
       final registerUrl = await AppConfig.getRegisterUrl();
+      final deviceSn = await AppConfig.getDeviceSn();
 
       final formData = FormData.fromMap({
         'name': name,
         'nip': nip,
+        'opd_id': opdId,
+        'source': 'mobile',
+        'device_sn': deviceSn,
         'photos': [
           for (final photo in photos)
             await MultipartFile.fromFile(
@@ -134,6 +141,26 @@ class ApiService {
       rethrow;
     } catch (e) {
       throw ApiError.fromException('Kesalahan tidak terduga: $e');
+    }
+  }
+
+  /// Fetches the list of OPD/Instansi from `/api/opd/list` (public, no auth).
+  /// Used by the registration form to populate the OPD dropdown.
+  /// Returns a list of maps: [{ "id": 1, "nama": "Diskominfo", "kode": "OPD-001" }]
+  static Future<List<Map<String, dynamic>>> fetchOpdList() async {
+    try {
+      final baseUrl = await AppConfig.getBaseUrl();
+      final url = '$baseUrl/api/opd/list';
+
+      final response = await _dio.get(url);
+
+      if (response.statusCode == 200 && response.data is List) {
+        return List<Map<String, dynamic>>.from(response.data);
+      }
+      return [];
+    } catch (e) {
+      print('⚠️ [OPD] Gagal mengambil daftar OPD: $e');
+      return [];
     }
   }
 

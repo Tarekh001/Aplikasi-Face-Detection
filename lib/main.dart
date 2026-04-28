@@ -13,6 +13,9 @@ Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   cameras = await availableCameras();
   
+  // Anti-spoofing sekarang berjalan server-side (Flask /api/check-spoof)
+  // Tidak perlu init SDK di client
+
   // Kirim heartbeat ke server di background
   ApiService.sendHeartbeat();
 

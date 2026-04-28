@@ -9,9 +9,24 @@ import 'package:path/path.dart' show join;
 import 'package:path_provider/path_provider.dart';
 
 import 'services/api_service.dart';
-
+import 'services/anti_spoof_service.dart';
 import 'models/api_error.dart';
 import 'hasil_view.dart';
+
+// ═══════════════════════════════════════════════════════════════
+// STATE MACHINE — 3-Phase Liveness Pipeline
+// ═══════════════════════════════════════════════════════════════
+// Phase 1: PASSIVE_CHECK   → Server-side MiniFASNet anti-spoofing
+// Phase 2: ACTIVE_LIVENESS → ML Kit (blink + head turn)
+// Phase 3: COUNTDOWN       → 3-2-1 → Capture → Upload
+// ═══════════════════════════════════════════════════════════════
+enum PresensiPhase {
+  passiveCheck,
+  activeLiveness,
+  countdown,
+  uploading,
+  error,
+}
 
 class PresensiView extends StatefulWidget {
   const PresensiView({super.key});
@@ -20,11 +35,23 @@ class PresensiView extends StatefulWidget {
   State<PresensiView> createState() => _PresensiViewState();
 }
 
-class _PresensiViewState extends State<PresensiView> {
+class _PresensiViewState extends State<PresensiView>
+    with TickerProviderStateMixin {
+  // ── Camera ──
   CameraController? _cameraController;
   late List<CameraDescription> _cameras;
-  bool _isDetecting = false;
-  String _detectionText = "Arahkan wajah ke kamera";
+
+  // ── State Machine ──
+  PresensiPhase _phase = PresensiPhase.passiveCheck;
+
+  // ── Phase 1: Passive Anti-Spoofing (Server-side) ──
+  Timer? _passiveCheckTimer;
+  bool _isPassiveChecking = false;
+  double _livenessScore = 0.0;
+  int _consecutiveRealCount = 0;
+  static const int _requiredConsecutiveReal = 3;
+
+  // ── Phase 2: Active Liveness (ML Kit) ──
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
       enableContours: true,
@@ -32,30 +59,40 @@ class _PresensiViewState extends State<PresensiView> {
       performanceMode: FaceDetectorMode.accurate,
     ),
   );
-
+  bool _isDetecting = false;
   bool _hasBlinked = false;
   bool _hasTurnedHead = false;
-  bool _isUploading = false;
-  bool _isCountingDown = false;
+
+  // ── Phase 3: Countdown ──
   int _countdownValue = 3;
-  bool _hasError = false;
+
+  // ── UI States ──
+  String _statusText = "Menganalisis tekstur wajah...";
   String _errorMessage = '';
   Timer? _errorResetTimer;
+
+  // ── Animations ──
+  late AnimationController _pulseController;
 
   @override
   void initState() {
     super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1500),
+    )..repeat(reverse: true);
     _initializeCamera();
   }
 
+  // ═══════════════════════════════════════════
+  // CAMERA INITIALIZATION
+  // ═══════════════════════════════════════════
   Future<void> _initializeCamera() async {
     try {
       _cameras = await availableCameras();
-      if (_cameras.isEmpty) {
-        throw Exception("Tidak ada kamera yang tersedia");
-      }
+      if (_cameras.isEmpty) throw Exception("Tidak ada kamera");
 
-      final CameraDescription camera = _cameras.firstWhere(
+      final camera = _cameras.firstWhere(
         (cam) => cam.lensDirection == CameraLensDirection.front,
         orElse: () => _cameras[0],
       );
@@ -68,55 +105,173 @@ class _PresensiViewState extends State<PresensiView> {
 
       await _cameraController!.initialize();
       if (!mounted) return;
-
       setState(() {});
-      _startFaceDetection();
+      _startPassiveCheck();
     } catch (e) {
-      debugPrint("⚠️ Error in _initializeCamera: $e");
-      setState(() {
-        _detectionText = "Kamera tidak dapat diinisialisasi ❌";
-      });
+      debugPrint("⚠️ Error _initializeCamera: $e");
+      setState(() => _statusText = "Kamera tidak dapat diinisialisasi ❌");
     }
   }
 
-  InputImageRotation _rotationFromSensorOrientation(int sensorOrientation) {
-    switch (sensorOrientation) {
-      case 0:
-        return InputImageRotation.rotation0deg;
-      case 90:
-        return InputImageRotation.rotation90deg;
-      case 180:
-        return InputImageRotation.rotation180deg;
-      case 270:
-        return InputImageRotation.rotation270deg;
-      default:
-        return InputImageRotation.rotation0deg;
+  // ═══════════════════════════════════════════
+  // PHASE 1: SERVER-SIDE ANTI-SPOOFING
+  // ═══════════════════════════════════════════
+  void _startPassiveCheck() {
+    setState(() {
+      _phase = PresensiPhase.passiveCheck;
+      _statusText = "🛡️ Menganalisis gerakan wajah...";
+      _livenessScore = 0.0;
+      _consecutiveRealCount = 0;
+    });
+
+    _passiveCheckTimer?.cancel();
+    // Interval lebih panjang karena capture 3 frame + upload + analisis
+    _passiveCheckTimer = Timer.periodic(
+      const Duration(milliseconds: 3000),
+      (_) => _runPassiveCheck(),
+    );
+    // Run immediately on first call
+    _runPassiveCheck();
+  }
+
+  Future<void> _runPassiveCheck() async {
+    if (_isPassiveChecking ||
+        _cameraController == null ||
+        !_cameraController!.value.isInitialized ||
+        _phase != PresensiPhase.passiveCheck) {
+      return;
     }
+    _isPassiveChecking = true;
+
+    List<String> framePaths = [];
+
+    try {
+      setState(() => _statusText = "🛡️ Mengambil frame...");
+
+      // Capture 3 frames with 200ms interval
+      for (int i = 0; i < AntiSpoofService.requiredFrames; i++) {
+        if (!mounted || _phase != PresensiPhase.passiveCheck) break;
+        final XFile xFile = await _cameraController!.takePicture();
+        framePaths.add(xFile.path);
+        if (i < AntiSpoofService.requiredFrames - 1) {
+          await Future.delayed(
+            Duration(milliseconds: AntiSpoofService.frameIntervalMs),
+          );
+        }
+      }
+
+      if (framePaths.length < 2) {
+        _isPassiveChecking = false;
+        return;
+      }
+
+      setState(() => _statusText = "🛡️ Menganalisis gerakan wajah...");
+
+      // Send all frames to server for multi-frame temporal analysis
+      final LivenessResult? result =
+          await AntiSpoofService.checkLivenessMultiFrame(framePaths);
+
+      // Cleanup frame files
+      for (final path in framePaths) {
+        try { await File(path).delete(); } catch (_) {}
+      }
+      framePaths.clear();
+
+      if (!mounted || _phase != PresensiPhase.passiveCheck) return;
+
+      if (result == null) {
+        debugPrint('⚠️ [PASSIVE] Server unreachable, skipping to active');
+        _passiveCheckTimer?.cancel();
+        _advanceToActiveLiveness();
+        return;
+      }
+
+      if (!result.faceDetected) {
+        setState(() {
+          _livenessScore = 0.0;
+          _consecutiveRealCount = 0;
+          _statusText = "Tidak ada wajah terdeteksi ❌";
+        });
+      } else if (result.isReal) {
+        _consecutiveRealCount++;
+        setState(() {
+          _livenessScore = result.score;
+          _statusText =
+              "🛡️ Anti-Spoofing: REAL ✅ (${(_livenessScore * 100).toStringAsFixed(0)}%)"
+              "\n$_consecutiveRealCount/$_requiredConsecutiveReal verifikasi...";
+        });
+
+        if (_consecutiveRealCount >= _requiredConsecutiveReal) {
+          _passiveCheckTimer?.cancel();
+          await Future.delayed(const Duration(milliseconds: 500));
+          if (!mounted) return;
+          _advanceToActiveLiveness();
+        }
+      } else {
+        // SPOOF DETECTED
+        _consecutiveRealCount = 0;
+        setState(() {
+          _livenessScore = result.score;
+          _statusText =
+              "🚫 SPOOFING TERDETEKSI! (${(_livenessScore * 100).toStringAsFixed(0)}%)"
+              "\nGunakan wajah asli Anda";
+        });
+      }
+    } catch (e) {
+      debugPrint("❌ [PASSIVE] Error: $e");
+    }
+    _isPassiveChecking = false;
+  }
+
+  // ═══════════════════════════════════════════
+  // PHASE 2: ACTIVE LIVENESS (ML Kit)
+  // ═══════════════════════════════════════════
+  void _advanceToActiveLiveness() {
+    if (!mounted) return;
+    _passiveCheckTimer?.cancel();
+    setState(() {
+      _phase = PresensiPhase.activeLiveness;
+      _hasBlinked = false;
+      _hasTurnedHead = false;
+      _statusText = "Kedipkan mata & putar kepala";
+    });
+    _startFaceDetection();
   }
 
   void _startFaceDetection() {
     if (_cameraController == null || !_cameraController!.value.isInitialized) return;
 
     _cameraController!.startImageStream((CameraImage image) async {
-      if (_isDetecting || _isCountingDown || _isUploading) return;
+      if (_isDetecting || _phase != PresensiPhase.activeLiveness) return;
       _isDetecting = true;
 
       try {
         final faces = await _detectFaces(image);
-
         if (faces.isNotEmpty) {
-          _validateLiveness(faces);
+          final Face targetFace = faces.reduce((a, b) {
+            final areaA = a.boundingBox.width * a.boundingBox.height;
+            final areaB = b.boundingBox.width * b.boundingBox.height;
+            return areaA >= areaB ? a : b;
+          });
+          _validateActiveLiveness(targetFace);
         } else {
-          if (mounted) {
-            setState(() => _detectionText = "Tidak Ada Wajah ❌");
-          }
+          if (mounted) setState(() => _statusText = "Tidak Ada Wajah ❌");
         }
       } catch (e) {
         debugPrint("⚠️ Error Face Detection: $e");
       }
-
       _isDetecting = false;
     });
+  }
+
+  InputImageRotation _rotationFromSensorOrientation(int sensorOrientation) {
+    switch (sensorOrientation) {
+      case 0: return InputImageRotation.rotation0deg;
+      case 90: return InputImageRotation.rotation90deg;
+      case 180: return InputImageRotation.rotation180deg;
+      case 270: return InputImageRotation.rotation270deg;
+      default: return InputImageRotation.rotation0deg;
+    }
   }
 
   Uint8List _convertYUV420toNV21(CameraImage image) {
@@ -124,14 +279,11 @@ class _PresensiViewState extends State<PresensiView> {
     final int height = image.height;
     final int ySize = width * height;
     final int uvSize = width * height ~/ 2;
-
     final Uint8List nv21Image = Uint8List(ySize + uvSize);
-
     final Plane planeY = image.planes[0];
     final Plane planeU = image.planes[1];
     final Plane planeV = image.planes[2];
 
-    // Copy Y
     int index = 0;
     for (int row = 0; row < height; row++) {
       final int rowOffset = row * planeY.bytesPerRow;
@@ -139,18 +291,15 @@ class _PresensiViewState extends State<PresensiView> {
       index += width;
     }
 
-    // Copy interleaved VU
     final int chromaRowStride = planeU.bytesPerRow;
     final int chromaPixelStride = planeU.bytesPerPixel!;
-
     for (int row = 0; row < height ~/ 2; row++) {
       for (int col = 0; col < width ~/ 2; col++) {
         final int uvOffset = row * chromaRowStride + col * chromaPixelStride;
-        nv21Image[index++] = planeV.bytes[uvOffset]; // V
-        nv21Image[index++] = planeU.bytes[uvOffset]; // U
+        nv21Image[index++] = planeV.bytes[uvOffset];
+        nv21Image[index++] = planeU.bytes[uvOffset];
       }
     }
-
     return nv21Image;
   }
 
@@ -158,9 +307,7 @@ class _PresensiViewState extends State<PresensiView> {
     try {
       final camera = _cameraController!.description;
       final rotation = _rotationFromSensorOrientation(camera.sensorOrientation);
-
       final nv21Bytes = _convertYUV420toNV21(image);
-
       final inputImage = InputImage.fromBytes(
         bytes: nv21Bytes,
         metadata: InputImageMetadata(
@@ -170,7 +317,6 @@ class _PresensiViewState extends State<PresensiView> {
           bytesPerRow: image.planes[0].bytesPerRow,
         ),
       );
-
       return await _faceDetector.processImage(inputImage);
     } catch (e) {
       debugPrint("❌ _detectFaces error: $e");
@@ -178,25 +324,17 @@ class _PresensiViewState extends State<PresensiView> {
     }
   }
 
-  void _validateLiveness(List<Face> faces) async {
-    final face = faces.first;
-
+  void _validateActiveLiveness(Face face) {
     double? leftEye = face.leftEyeOpenProbability;
     double? rightEye = face.rightEyeOpenProbability;
     double headTurn = face.headEulerAngleY ?? 0;
 
     if (leftEye != null && rightEye != null) {
-      if (leftEye < 0.3 && rightEye < 0.3) {
-        _hasBlinked = true;
-      }
+      if (leftEye < 0.3 && rightEye < 0.3) _hasBlinked = true;
     }
-
-    if (headTurn > 15 || headTurn < -15) {
-      _hasTurnedHead = true;
-    }
+    if (headTurn > 15 || headTurn < -15) _hasTurnedHead = true;
 
     if (_hasBlinked && _hasTurnedHead) {
-      // Liveness verified → start countdown
       _startCountdown();
     } else {
       String hint = '';
@@ -207,23 +345,22 @@ class _PresensiViewState extends State<PresensiView> {
       } else {
         hint = 'Putar kepala ke samping ↔️';
       }
-      if (mounted) {
-        setState(() => _detectionText = hint);
-      }
+      if (mounted) setState(() => _statusText = hint);
     }
   }
 
-  /// Step 7: Countdown 3-2-1 before capture
+  // ═══════════════════════════════════════════
+  // PHASE 3: COUNTDOWN → CAPTURE → UPLOAD
+  // ═══════════════════════════════════════════
   void _startCountdown() async {
-    if (_isCountingDown) return;
+    if (_phase == PresensiPhase.countdown) return;
 
     setState(() {
-      _isCountingDown = true;
+      _phase = PresensiPhase.countdown;
       _countdownValue = 3;
-      _detectionText = "Liveness Verified ✅";
+      _statusText = "Liveness Verified ✅";
     });
 
-    // Stop image stream during countdown
     await _cameraController!.stopImageStream();
 
     for (int i = 3; i >= 1; i--) {
@@ -233,24 +370,19 @@ class _PresensiViewState extends State<PresensiView> {
     }
 
     if (!mounted) return;
-    setState(() => _isCountingDown = false);
-
-    // Capture and upload
     await _captureAndUpload();
   }
 
-  /// Captures photo, crops face, and uploads via ApiService
   Future<void> _captureAndUpload() async {
     setState(() {
-      _isUploading = true;
-      _detectionText = "⏳ Memproses foto...";
+      _phase = PresensiPhase.uploading;
+      _statusText = "⏳ Memproses foto...";
     });
 
     try {
       final croppedPath = await _takeAndCropFacePicture();
       if (croppedPath != null) {
-        final croppedFile = File(croppedPath);
-        await _uploadPhoto(croppedFile);
+        await _uploadPhoto(File(croppedPath));
       } else {
         _showError("Gagal memproses foto wajah");
       }
@@ -260,18 +392,12 @@ class _PresensiViewState extends State<PresensiView> {
     }
   }
 
-  /// Uploads the cropped face photo using the centralized ApiService.
   Future<void> _uploadPhoto(File photoFile) async {
-    setState(() {
-      _detectionText = "⏳ Mengunggah foto...";
-    });
+    setState(() => _statusText = "⏳ Mengunggah foto...");
 
     try {
       final result = await ApiService.predictFace(photoFile);
-
       if (!mounted) return;
-
-      // Success! Navigate to result screen
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
@@ -283,55 +409,9 @@ class _PresensiViewState extends State<PresensiView> {
         ),
       );
     } on ApiError catch (e) {
-      debugPrint("❌ API Error: $e");
       _showError(e.error);
     } catch (e) {
-      debugPrint("❌ Upload error: $e");
       _showError("Upload gagal: ${e.toString().split('\n').first}");
-    }
-  }
-
-  /// Shows error overlay with auto-reset after 5 seconds
-  void _showError(String message) {
-    if (!mounted) return;
-
-    setState(() {
-      _hasError = true;
-      _errorMessage = message;
-      _isUploading = false;
-    });
-
-    // Auto-reset after 5 seconds
-    _errorResetTimer?.cancel();
-    _errorResetTimer = Timer(const Duration(seconds: 5), () {
-      _resetState();
-    });
-  }
-
-  /// Resets everything to initial state — ready for next person
-  void _resetState() {
-    if (!mounted) return;
-
-    _errorResetTimer?.cancel();
-
-    setState(() {
-      _hasBlinked = false;
-      _hasTurnedHead = false;
-      _isDetecting = false;
-      _isUploading = false;
-      _isCountingDown = false;
-      _hasError = false;
-      _errorMessage = '';
-      _detectionText = "Arahkan wajah ke kamera";
-    });
-
-    // Restart camera stream
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
-      try {
-        _startFaceDetection();
-      } catch (e) {
-        debugPrint("⚠️ Error restarting face detection: $e");
-      }
     }
   }
 
@@ -339,17 +419,13 @@ class _PresensiViewState extends State<PresensiView> {
     try {
       final tempDir = await getTemporaryDirectory();
       final imagePath = join(tempDir.path, '${DateTime.now().millisecondsSinceEpoch}.jpg');
-
       final XFile file = await _cameraController!.takePicture();
       await file.saveTo(imagePath);
 
       final inputImage = InputImage.fromFilePath(imagePath);
       final detectorOptions = FaceDetectorOptions(
         performanceMode: FaceDetectorMode.accurate,
-        enableContours: false,
-        enableLandmarks: false,
       );
-
       final faceDetector = FaceDetector(options: detectorOptions);
       final faces = await faceDetector.processImage(inputImage);
 
@@ -358,16 +434,16 @@ class _PresensiViewState extends State<PresensiView> {
         return imagePath;
       }
 
-      final face = faces.first;
+      final face = faces.reduce((a, b) {
+        final areaA = a.boundingBox.width * a.boundingBox.height;
+        final areaB = b.boundingBox.width * b.boundingBox.height;
+        return areaA >= areaB ? a : b;
+      });
       final boundingBox = face.boundingBox;
 
       final bytes = await File(imagePath).readAsBytes();
       final originalImage = img.decodeImage(bytes);
-
-      if (originalImage == null) {
-        debugPrint("❌ Gagal decode gambar untuk cropping.");
-        return null;
-      }
+      if (originalImage == null) return null;
 
       final x = boundingBox.left.toInt().clamp(0, originalImage.width - 1);
       final y = boundingBox.top.toInt().clamp(0, originalImage.height - 1);
@@ -375,10 +451,8 @@ class _PresensiViewState extends State<PresensiView> {
       final height = boundingBox.height.toInt().clamp(1, originalImage.height - y);
 
       final cropped = img.copyCrop(originalImage, x: x, y: y, width: width, height: height);
-
       final croppedPath = join(tempDir.path, 'cropped_${DateTime.now().millisecondsSinceEpoch}.jpg');
       File(croppedPath).writeAsBytesSync(img.encodeJpg(cropped));
-
       return croppedPath;
     } catch (e) {
       debugPrint("❌ Error cropping wajah: $e");
@@ -386,9 +460,51 @@ class _PresensiViewState extends State<PresensiView> {
     }
   }
 
+  // ═══════════════════════════════════════════
+  // ERROR HANDLING & RESET
+  // ═══════════════════════════════════════════
+  void _showError(String message) {
+    if (!mounted) return;
+    setState(() {
+      _phase = PresensiPhase.error;
+      _errorMessage = message;
+    });
+    _errorResetTimer?.cancel();
+    _errorResetTimer = Timer(const Duration(seconds: 5), _resetState);
+  }
+
+  void _resetState() {
+    if (!mounted) return;
+    _errorResetTimer?.cancel();
+    _passiveCheckTimer?.cancel();
+
+    setState(() {
+      _phase = PresensiPhase.passiveCheck;
+      _hasBlinked = false;
+      _hasTurnedHead = false;
+      _isDetecting = false;
+      _isPassiveChecking = false;
+      _errorMessage = '';
+      _livenessScore = 0.0;
+      _consecutiveRealCount = 0;
+      _statusText = "Menganalisis tekstur wajah...";
+    });
+
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try {
+        try { _cameraController!.stopImageStream(); } catch (_) {}
+        _startPassiveCheck();
+      } catch (e) {
+        debugPrint("⚠️ Error restarting: $e");
+      }
+    }
+  }
+
   @override
   void dispose() {
     _errorResetTimer?.cancel();
+    _passiveCheckTimer?.cancel();
+    _pulseController.dispose();
     if (_cameraController != null && _cameraController!.value.isInitialized) {
       _cameraController!.dispose();
     }
@@ -396,6 +512,9 @@ class _PresensiViewState extends State<PresensiView> {
     super.dispose();
   }
 
+  // ═══════════════════════════════════════════
+  // BUILD UI
+  // ═══════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -409,78 +528,37 @@ class _PresensiViewState extends State<PresensiView> {
           : Stack(
               children: [
                 // Camera preview
-                Positioned.fill(
-                  child: CameraPreview(_cameraController!),
-                ),
+                Positioned.fill(child: CameraPreview(_cameraController!)),
 
-                // Face detection guide overlay (oval frame)
+                // Oval face guide
                 Center(
-                  child: Container(
-                    width: 260,
-                    height: 340,
-                    decoration: BoxDecoration(
-                      border: Border.all(
-                        color: _hasBlinked && _hasTurnedHead
-                            ? Colors.green
-                            : Colors.white.withValues(alpha: 0.6),
-                        width: 3,
-                      ),
-                      borderRadius: BorderRadius.circular(130),
-                    ),
+                  child: AnimatedBuilder(
+                    animation: _pulseController,
+                    builder: (context, _) {
+                      return Container(
+                        width: 260,
+                        height: 340,
+                        decoration: BoxDecoration(
+                          border: Border.all(
+                            color: _getOvalColor(),
+                            width: 3 + (_pulseController.value * 0.5),
+                          ),
+                          borderRadius: BorderRadius.circular(130),
+                        ),
+                      );
+                    },
                   ),
                 ),
+
+                // Phase indicator (top)
+                Positioned(top: 16, left: 16, right: 16, child: _buildPhaseIndicator()),
 
                 // Liveness checklist
-                Positioned(
-                  top: 16,
-                  left: 16,
-                  right: 16,
-                  child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withValues(alpha: 0.6),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Icon(
-                          _hasBlinked ? Icons.check_circle : Icons.radio_button_unchecked,
-                          color: _hasBlinked ? Colors.greenAccent : Colors.white54,
-                          size: 20,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Kedip',
-                          style: TextStyle(
-                            color: _hasBlinked ? Colors.greenAccent : Colors.white54,
-                            fontSize: 14,
-                          ),
-                        ),
-                        const SizedBox(width: 20),
-                        Icon(
-                          _hasTurnedHead ? Icons.check_circle : Icons.radio_button_unchecked,
-                          color: _hasTurnedHead ? Colors.greenAccent : Colors.white54,
-                          size: 20,
-                        ),
-                        const SizedBox(width: 6),
-                        Text(
-                          'Putar Kepala',
-                          style: TextStyle(
-                            color: _hasTurnedHead ? Colors.greenAccent : Colors.white54,
-                            fontSize: 14,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
+                Positioned(top: 80, left: 16, right: 16, child: _buildChecklist()),
 
-                // Detection status text
+                // Status text (bottom)
                 Positioned(
-                  bottom: 50,
-                  left: 0,
-                  right: 0,
+                  bottom: 50, left: 0, right: 0,
                   child: Center(
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
@@ -488,122 +566,241 @@ class _PresensiViewState extends State<PresensiView> {
                         color: Colors.black.withValues(alpha: 0.7),
                         borderRadius: BorderRadius.circular(12),
                       ),
-                      child: Text(
-                        _detectionText,
-                        style: const TextStyle(color: Colors.white, fontSize: 16),
-                        textAlign: TextAlign.center,
-                      ),
+                      child: Text(_statusText,
+                          style: const TextStyle(color: Colors.white, fontSize: 16),
+                          textAlign: TextAlign.center),
                     ),
                   ),
                 ),
 
-                // Step 7: Countdown overlay
-                if (_isCountingDown)
-                  Container(
-                    color: Colors.black.withValues(alpha: 0.7),
-                    child: Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          const Text(
-                            'Tetap diam...',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w300,
-                            ),
-                          ),
-                          const SizedBox(height: 20),
-                          TweenAnimationBuilder<double>(
-                            key: ValueKey(_countdownValue),
-                            tween: Tween(begin: 1.5, end: 1.0),
-                            duration: const Duration(milliseconds: 400),
-                            curve: Curves.easeOut,
-                            builder: (context, scale, child) {
-                              return Transform.scale(
-                                scale: scale,
-                                child: Text(
-                                  '$_countdownValue',
-                                  style: const TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 100,
-                                    fontWeight: FontWeight.bold,
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+                // Spoof warning overlay
+                if (_phase == PresensiPhase.passiveCheck &&
+                    _livenessScore > 0 &&
+                    _livenessScore < AntiSpoofService.livenessThreshold)
+                  _buildSpoofOverlay(),
 
-                // Upload loading overlay
-                if (_isUploading && !_hasError)
-                  Container(
-                    color: Colors.black.withValues(alpha: 0.7),
-                    child: const Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CircularProgressIndicator(color: Colors.white),
-                          SizedBox(height: 20),
-                          Text(
-                            "Mengunggah & memproses...",
-                            style: TextStyle(color: Colors.white, fontSize: 18),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
+                // Countdown overlay
+                if (_phase == PresensiPhase.countdown) _buildCountdownOverlay(),
 
-                // Step 9: Error overlay with retry
-                if (_hasError)
-                  Container(
-                    color: Colors.black.withValues(alpha: 0.85),
-                    child: Center(
-                      child: Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 32),
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Icon(Icons.error_outline, color: Colors.redAccent, size: 72),
-                            const SizedBox(height: 16),
-                            Text(
-                              _errorMessage,
-                              textAlign: TextAlign.center,
-                              style: const TextStyle(
-                                color: Colors.white,
-                                fontSize: 20,
-                                fontWeight: FontWeight.w500,
-                              ),
-                            ),
-                            const SizedBox(height: 24),
-                            ElevatedButton.icon(
-                              onPressed: _resetState,
-                              icon: const Icon(Icons.refresh),
-                              label: const Text('Coba Lagi', style: TextStyle(fontSize: 16)),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.deepPurple,
-                                foregroundColor: Colors.white,
-                                padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
-                                shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                              ),
-                            ),
-                            const SizedBox(height: 12),
-                            const Text(
-                              'Otomatis reset dalam 5 detik...',
-                              style: TextStyle(color: Colors.white54, fontSize: 13),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ),
+                // Upload overlay
+                if (_phase == PresensiPhase.uploading) _buildUploadOverlay(),
+
+                // Error overlay
+                if (_phase == PresensiPhase.error) _buildErrorOverlay(),
               ],
             ),
+    );
+  }
+
+  // ═══════════════════════════════════════════
+  // UI WIDGETS
+  // ═══════════════════════════════════════════
+  Color _getOvalColor() {
+    switch (_phase) {
+      case PresensiPhase.passiveCheck:
+        return _consecutiveRealCount > 0
+            ? Colors.greenAccent
+            : Colors.amberAccent.withValues(alpha: 0.6);
+      case PresensiPhase.activeLiveness:
+        return (_hasBlinked && _hasTurnedHead)
+            ? Colors.green
+            : Colors.white.withValues(alpha: 0.6);
+      case PresensiPhase.countdown:
+        return Colors.green;
+      default:
+        return Colors.white.withValues(alpha: 0.4);
+    }
+  }
+
+  Widget _buildPhaseIndicator() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+        children: [
+          _phaseStep(Icons.shield_outlined, 'Anti-Spoof',
+              isActive: _phase == PresensiPhase.passiveCheck,
+              isDone: _phase != PresensiPhase.passiveCheck && _phase != PresensiPhase.error),
+          const Padding(padding: EdgeInsets.only(bottom: 12),
+              child: Icon(Icons.chevron_right, color: Colors.white24, size: 18)),
+          _phaseStep(Icons.face_retouching_natural, 'Liveness',
+              isActive: _phase == PresensiPhase.activeLiveness,
+              isDone: _phase == PresensiPhase.countdown || _phase == PresensiPhase.uploading),
+          const Padding(padding: EdgeInsets.only(bottom: 12),
+              child: Icon(Icons.chevron_right, color: Colors.white24, size: 18)),
+          _phaseStep(Icons.camera_alt, 'Presensi',
+              isActive: _phase == PresensiPhase.countdown || _phase == PresensiPhase.uploading,
+              isDone: false),
+        ],
+      ),
+    );
+  }
+
+  Widget _phaseStep(IconData icon, String label, {required bool isActive, required bool isDone}) {
+    final color = isDone ? Colors.greenAccent : (isActive ? Colors.amberAccent : Colors.white30);
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(isDone ? Icons.check_circle : icon, color: color, size: 22),
+        const SizedBox(height: 2),
+        Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+      ],
+    );
+  }
+
+  Widget _buildChecklist() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.6),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          _checkItem('Anti-Spoof',
+              done: _phase != PresensiPhase.passiveCheck && _phase != PresensiPhase.error,
+              inProgress: _consecutiveRealCount > 0 && _phase == PresensiPhase.passiveCheck),
+          const SizedBox(width: 16),
+          _checkItem('Kedip', done: _hasBlinked),
+          const SizedBox(width: 16),
+          _checkItem('Putar', done: _hasTurnedHead),
+        ],
+      ),
+    );
+  }
+
+  Widget _checkItem(String label, {bool done = false, bool inProgress = false}) {
+    final color = done ? Colors.greenAccent : (inProgress ? Colors.amberAccent : Colors.white54);
+    final icon = done
+        ? Icons.check_circle
+        : (inProgress ? Icons.timelapse : Icons.radio_button_unchecked);
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, color: color, size: 18),
+        const SizedBox(width: 4),
+        Text(label, style: TextStyle(color: color, fontSize: 13)),
+      ],
+    );
+  }
+
+  Widget _buildSpoofOverlay() {
+    return Container(
+      color: Colors.red.withValues(alpha: 0.3),
+      child: Center(
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 32),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.85),
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.redAccent, width: 2),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.gpp_bad, color: Colors.redAccent, size: 64),
+              const SizedBox(height: 12),
+              const Text('⚠️ SPOOFING TERDETEKSI',
+                  style: TextStyle(color: Colors.redAccent, fontSize: 22, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Text('Skor: ${(_livenessScore * 100).toStringAsFixed(1)}% (min. 45%)',
+                  style: const TextStyle(color: Colors.white70, fontSize: 14)),
+              const SizedBox(height: 8),
+              const Text('Gunakan wajah asli Anda.\nFoto atau layar tidak diizinkan.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white, fontSize: 16)),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCountdownOverlay() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.7),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Tetap diam...',
+                style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w300)),
+            const SizedBox(height: 20),
+            TweenAnimationBuilder<double>(
+              key: ValueKey(_countdownValue),
+              tween: Tween(begin: 1.5, end: 1.0),
+              duration: const Duration(milliseconds: 400),
+              curve: Curves.easeOut,
+              builder: (context, scale, child) {
+                return Transform.scale(
+                  scale: scale,
+                  child: Text('$_countdownValue',
+                      style: const TextStyle(color: Colors.white, fontSize: 100, fontWeight: FontWeight.bold)),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUploadOverlay() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.7),
+      child: const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(color: Colors.white),
+            SizedBox(height: 20),
+            Text("Mengunggah & memproses...",
+                style: TextStyle(color: Colors.white, fontSize: 18)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildErrorOverlay() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.85),
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.error_outline, color: Colors.redAccent, size: 72),
+              const SizedBox(height: 16),
+              Text(_errorMessage,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w500)),
+              const SizedBox(height: 24),
+              ElevatedButton.icon(
+                onPressed: _resetState,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Coba Lagi', style: TextStyle(fontSize: 16)),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.deepPurple,
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                ),
+              ),
+              const SizedBox(height: 12),
+              const Text('Otomatis reset dalam 5 detik...',
+                  style: TextStyle(color: Colors.white54, fontSize: 13)),
+            ],
+          ),
+        ),
+      ),
     );
   }
 }
