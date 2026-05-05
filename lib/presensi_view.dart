@@ -8,10 +8,13 @@ import 'package:image/image.dart' as img;
 import 'package:path/path.dart' show join;
 import 'package:path_provider/path_provider.dart';
 
+import 'config/app_config.dart';
 import 'services/api_service.dart';
 import 'services/anti_spoof_service.dart';
 import 'models/api_error.dart';
 import 'hasil_view.dart';
+import 'admin/admin_unlock_view.dart';
+import 'settings/settings_view.dart';
 
 // ═══════════════════════════════════════════════════════════════
 // STATE MACHINE — 3-Phase Liveness Pipeline
@@ -74,6 +77,13 @@ class _PresensiViewState extends State<PresensiView>
   // ── Animations ──
   late AnimationController _pulseController;
 
+  // ── OPD Name (for display + 7-tap hatch) ──
+  String _opdName = 'Memuat...';
+
+  // ── Emergency Hatch (7 rapid taps → PIN dialog) ──
+  int _emergencyTapCount = 0;
+  DateTime _lastTapTime = DateTime(2000);
+
   @override
   void initState() {
     super.initState();
@@ -81,7 +91,13 @@ class _PresensiViewState extends State<PresensiView>
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     )..repeat(reverse: true);
+    _loadOpdName();
     _initializeCamera();
+  }
+
+  Future<void> _loadOpdName() async {
+    final name = await AppConfig.getBoundOpdName();
+    if (mounted) setState(() => _opdName = name);
   }
 
   // ═══════════════════════════════════════════
@@ -408,6 +424,8 @@ class _PresensiViewState extends State<PresensiView>
           ),
         ),
       );
+    } on DeviceUnboundException catch (e) {
+      await _handleDeviceUnbound(e.message);
     } on ApiError catch (e) {
       _showError(e.error);
     } catch (e) {
@@ -513,82 +531,363 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   // ═══════════════════════════════════════════
-  // BUILD UI
+  // ADMIN UNLOCK — Navigate to separate view (avoids CameraException)
+  // ═══════════════════════════════════════════
+  Future<void> _handleAdminUnlock() async {
+    // 1. Stop all timers and camera
+    _passiveCheckTimer?.cancel();
+    _errorResetTimer?.cancel();
+
+    // 2. Dispose camera completely to free hardware
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try { await _cameraController!.stopImageStream(); } catch (_) {}
+      await _cameraController!.dispose();
+      _cameraController = null;
+    }
+
+    if (!mounted) return;
+
+    // 3. Navigate to AdminUnlockView (has its own camera)
+    await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const AdminUnlockView()),
+    );
+
+    // 4. Reinitialize camera when returning from admin view
+    if (mounted) {
+      setState(() {
+        _phase = PresensiPhase.passiveCheck;
+        _statusText = 'Menganalisis tekstur wajah...';
+        _hasBlinked = false;
+        _hasTurnedHead = false;
+        _consecutiveRealCount = 0;
+      });
+      await _initializeCamera();
+    }
+  }
+
+  /// Force-logout when device is unbound/deleted
+  Future<void> _handleDeviceUnbound(String message) async {
+    // Clear binding state
+    await AppConfig.setIsBound(false);
+    await AppConfig.setDeviceSn('');
+    await AppConfig.setBoundOpdName('');
+
+    // Stop camera
+    _passiveCheckTimer?.cancel();
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try { await _cameraController!.stopImageStream(); } catch (_) {}
+      await _cameraController!.dispose();
+      _cameraController = null;
+    }
+
+    if (!mounted) return;
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.warning_amber, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(child: Text(message)),
+          ],
+        ),
+        backgroundColor: Colors.red[700],
+        duration: const Duration(seconds: 5),
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+
+    // Navigate to root → SplashRouter redirects to ActivationView
+    Navigator.of(context).pushNamedAndRemoveUntil('/', (route) => false);
+  }
+
+  // ═══════════════════════════════════════════
+  // EMERGENCY HATCH — 7 rapid taps on OPD name
+  // ═══════════════════════════════════════════
+  void _handleEmergencyTap() {
+    final now = DateTime.now();
+    if (now.difference(_lastTapTime).inMilliseconds > 1000) {
+      _emergencyTapCount = 0;
+    }
+    _emergencyTapCount++;
+    _lastTapTime = now;
+
+    if (_emergencyTapCount >= 7) {
+      _emergencyTapCount = 0;
+      _showEmergencyPinDialog();
+    }
+  }
+
+  void _showEmergencyPinDialog() {
+    final pinController = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: const Row(
+          children: [
+            Icon(Icons.emergency, color: Colors.orange, size: 24),
+            SizedBox(width: 8),
+            Text('Emergency Access', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('Masukkan PIN darurat untuk membuka pengaturan.',
+                style: TextStyle(fontSize: 13, color: Colors.grey)),
+            const SizedBox(height: 16),
+            TextField(
+              controller: pinController,
+              keyboardType: TextInputType.number,
+              obscureText: true,
+              maxLength: 6,
+              autofocus: true,
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 24, fontWeight: FontWeight.bold, letterSpacing: 8),
+              decoration: InputDecoration(
+                hintText: '••••••',
+                counterText: '',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: const BorderSide(color: Colors.deepPurple, width: 2),
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Batal'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (pinController.text == '999999') {
+                Navigator.pop(ctx);
+                // Pause camera, go to settings
+                _pauseCameraAndNavigate(const SettingsView());
+              } else {
+                Navigator.pop(ctx);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('PIN salah.'), backgroundColor: Colors.red),
+                );
+              }
+            },
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.deepPurple),
+            child: const Text('Buka', style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Pause camera, navigate to a page, reinitialize on return
+  Future<void> _pauseCameraAndNavigate(Widget page) async {
+    _passiveCheckTimer?.cancel();
+    _errorResetTimer?.cancel();
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try { await _cameraController!.stopImageStream(); } catch (_) {}
+      await _cameraController!.dispose();
+      _cameraController = null;
+    }
+    if (!mounted) return;
+    setState(() {});
+
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => page));
+
+    // Reinitialize camera on return
+    if (mounted) {
+      setState(() {
+        _phase = PresensiPhase.passiveCheck;
+        _statusText = 'Menganalisis tekstur wajah...';
+        _hasBlinked = false;
+        _hasTurnedHead = false;
+        _consecutiveRealCount = 0;
+      });
+      await _initializeCamera();
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // BUILD UI — Card-Based Layout
   // ═══════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
+    final screenHeight = MediaQuery.of(context).size.height;
+    final cameraHeight = screenHeight * 0.62;
+
     return Scaffold(
-      appBar: AppBar(
-        title: const Text("Presensi Wajah"),
-        backgroundColor: Colors.deepPurple,
-        foregroundColor: Colors.white,
-      ),
-      body: _cameraController == null || !_cameraController!.value.isInitialized
-          ? const Center(child: CircularProgressIndicator())
-          : Stack(
-              children: [
-                // Camera preview
-                Positioned.fill(child: CameraPreview(_cameraController!)),
-
-                // Oval face guide
-                Center(
-                  child: AnimatedBuilder(
-                    animation: _pulseController,
-                    builder: (context, _) {
-                      return Container(
-                        width: 260,
-                        height: 340,
-                        decoration: BoxDecoration(
-                          border: Border.all(
-                            color: _getOvalColor(),
-                            width: 3 + (_pulseController.value * 0.5),
-                          ),
-                          borderRadius: BorderRadius.circular(130),
-                        ),
-                      );
-                    },
+      backgroundColor: const Color(0xFF1A1A2E),
+      body: SafeArea(
+        child: Column(
+          children: [
+            // ── TOP HEADER BAR ──
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 12, 12, 0),
+              child: Row(
+                children: [
+                  // App branding
+                  const Icon(Icons.fingerprint, color: Colors.white, size: 22),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text('Presensi Wajah',
+                        style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
                   ),
-                ),
-
-                // Phase indicator (top)
-                Positioned(top: 16, left: 16, right: 16, child: _buildPhaseIndicator()),
-
-                // Liveness checklist
-                Positioned(top: 80, left: 16, right: 16, child: _buildChecklist()),
-
-                // Status text (bottom)
-                Positioned(
-                  bottom: 50, left: 0, right: 0,
-                  child: Center(
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                      decoration: BoxDecoration(
-                        color: Colors.black.withValues(alpha: 0.7),
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      child: Text(_statusText,
-                          style: const TextStyle(color: Colors.white, fontSize: 16),
-                          textAlign: TextAlign.center),
+                  // Hidden admin gear (almost invisible)
+                  Opacity(
+                    opacity: 0.08,
+                    child: IconButton(
+                      icon: const Icon(Icons.settings, color: Colors.white, size: 18),
+                      onPressed: _handleAdminUnlock,
                     ),
                   ),
-                ),
-
-                // Spoof warning overlay
-                if (_phase == PresensiPhase.passiveCheck &&
-                    _livenessScore > 0 &&
-                    _livenessScore < AntiSpoofService.livenessThreshold)
-                  _buildSpoofOverlay(),
-
-                // Countdown overlay
-                if (_phase == PresensiPhase.countdown) _buildCountdownOverlay(),
-
-                // Upload overlay
-                if (_phase == PresensiPhase.uploading) _buildUploadOverlay(),
-
-                // Error overlay
-                if (_phase == PresensiPhase.error) _buildErrorOverlay(),
-              ],
+                ],
+              ),
             ),
+
+            const SizedBox(height: 8),
+
+            // ── CAMERA CARD (top ~62%) ──
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: SizedBox(
+                height: cameraHeight,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: _cameraController == null || !_cameraController!.value.isInitialized
+                      ? Container(
+                          color: Colors.black,
+                          child: const Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                CircularProgressIndicator(color: Colors.white54),
+                                SizedBox(height: 12),
+                                Text('Memuat kamera...', style: TextStyle(color: Colors.white54, fontSize: 13)),
+                              ],
+                            ),
+                          ),
+                        )
+                      : Stack(
+                          fit: StackFit.expand,
+                          children: [
+                            // Camera preview — scaled to fill card
+                            FittedBox(
+                              fit: BoxFit.cover,
+                              child: SizedBox(
+                                width: _cameraController!.value.previewSize!.height,
+                                height: _cameraController!.value.previewSize!.width,
+                                child: CameraPreview(_cameraController!),
+                              ),
+                            ),
+
+                            // Oval face guide
+                            Center(
+                              child: AnimatedBuilder(
+                                animation: _pulseController,
+                                builder: (context, _) {
+                                  return Container(
+                                    width: 220,
+                                    height: 290,
+                                    decoration: BoxDecoration(
+                                      border: Border.all(
+                                        color: _getOvalColor(),
+                                        width: 2.5 + (_pulseController.value * 0.5),
+                                      ),
+                                      borderRadius: BorderRadius.circular(120),
+                                    ),
+                                  );
+                                },
+                              ),
+                            ),
+
+                            // Phase steps indicator (top inside camera)
+                            Positioned(
+                              top: 8, left: 8, right: 8,
+                              child: _buildPhaseIndicator(),
+                            ),
+
+                            // Spoof warning overlay
+                            if (_phase == PresensiPhase.passiveCheck &&
+                                _livenessScore > 0 &&
+                                _livenessScore < AntiSpoofService.livenessThreshold)
+                              _buildSpoofOverlay(),
+
+                            // Countdown overlay
+                            if (_phase == PresensiPhase.countdown) _buildCountdownOverlay(),
+
+                            // Upload overlay
+                            if (_phase == PresensiPhase.uploading) _buildUploadOverlay(),
+
+                            // Error overlay
+                            if (_phase == PresensiPhase.error) _buildErrorOverlay(),
+                          ],
+                        ),
+                ),
+              ),
+            ),
+
+            // ── BOTTOM STATUS PANEL (~38%) ──
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: Column(
+                  children: [
+                    // Liveness checklist
+                    _buildChecklist(),
+
+                    const SizedBox(height: 12),
+
+                    // Status text
+                    Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withAlpha(12),
+                        borderRadius: BorderRadius.circular(14),
+                        border: Border.all(color: Colors.white.withAlpha(15)),
+                      ),
+                      child: Text(_statusText,
+                          style: const TextStyle(color: Colors.white, fontSize: 15),
+                          textAlign: TextAlign.center),
+                    ),
+
+                    const Spacer(),
+
+                    // OPD Name (7-tap emergency hatch target)
+                    GestureDetector(
+                      onTap: _handleEmergencyTap,
+                      behavior: HitTestBehavior.opaque,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 4),
+                        child: Text(
+                          _opdName,
+                          style: TextStyle(
+                            color: Colors.white.withAlpha(80),
+                            fontSize: 11,
+                            fontWeight: FontWeight.w500,
+                          ),
+                          textAlign: TextAlign.center,
+                        ),
+                      ),
+                    ),
+
+                    const SizedBox(height: 2),
+                    Text(
+                      'Smart Presensi ASN — Diskominfo Kab. Tangerang',
+                      style: TextStyle(color: Colors.white.withAlpha(40), fontSize: 9),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -654,10 +953,11 @@ class _PresensiViewState extends State<PresensiView>
 
   Widget _buildChecklist() {
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
-        color: Colors.black.withValues(alpha: 0.6),
-        borderRadius: BorderRadius.circular(12),
+        color: Colors.white.withAlpha(15),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white.withAlpha(10)),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.center,

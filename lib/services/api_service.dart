@@ -7,6 +7,19 @@ import '../models/api_error.dart';
 
 /// Centralized API service for communicating with the Flask backend.
 /// Handles predict (attendance) and register (enrollment) requests.
+
+/// Thrown when backend returns DEVICE_NOT_FOUND or DeviceUnbound.
+/// Device was deleted or unbound by admin — kiosk must re-activate.
+class DeviceUnboundException implements Exception {
+  final String message;
+  DeviceUnboundException([this.message = 'Akses Kiosk diputus oleh Server. Silakan aktivasi ulang.']);
+  @override
+  String toString() => message;
+}
+
+/// Legacy alias — keep for backward compatibility
+typedef DeviceNotFoundException = DeviceUnboundException;
+
 class ApiService {
   static final Dio _dio = Dio(
     BaseOptions(
@@ -15,6 +28,49 @@ class ApiService {
       sendTimeout: const Duration(seconds: 30),
     ),
   );
+
+  /// Admin login via `POST /api/login`.
+  ///
+  /// Returns response map with `access_token` and `user` info.
+  /// Throws [ApiError] on failure (401, 403, 404).
+  static Future<Map<String, dynamic>> loginAdmin(
+    String username,
+    String password,
+  ) async {
+    try {
+      final baseUrl = await AppConfig.getBaseUrl();
+      final loginUrl = '$baseUrl/api/login';
+
+      final response = await _dio.post(loginUrl, data: {
+        'username': username,
+        'password': password,
+      });
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        return response.data;
+      }
+      throw ApiError.fromStatusCode(
+        response.statusCode ?? 500,
+        serverMessage: _extractErrorMessage(response.data),
+      );
+    } on DioException catch (e) {
+      if (e.response != null) {
+        throw ApiError.fromStatusCode(
+          e.response!.statusCode ?? 500,
+          serverMessage: _extractErrorMessage(e.response?.data),
+        );
+      }
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.connectionError) {
+        throw ApiError.fromException('Tidak dapat terhubung ke server');
+      }
+      throw ApiError.fromException('Kesalahan jaringan: ${e.message}');
+    } on ApiError {
+      rethrow;
+    } catch (e) {
+      throw ApiError.fromException('Kesalahan tidak terduga: $e');
+    }
+  }
 
   /// Sends a face photo to `/api/predict` for attendance recognition.
   ///
@@ -50,6 +106,7 @@ class ApiService {
       }
     } on DioException catch (e) {
       if (e.response != null) {
+        _checkDeviceNotFound(e.response?.data);
         throw ApiError.fromStatusCode(
           e.response!.statusCode ?? 500,
           serverMessage: _extractErrorMessage(e.response?.data),
@@ -67,6 +124,8 @@ class ApiService {
         throw ApiError.fromException('Kesalahan jaringan: ${e.message}');
       }
     } on ApiError {
+      rethrow;
+    } on DeviceNotFoundException {
       rethrow;
     } catch (e) {
       throw ApiError.fromException('Kesalahan tidak terduga: $e');
@@ -212,6 +271,121 @@ class ApiService {
       print('✅ [Heartbeat] Berhasil update data device ke server (SN: $deviceSn, IP: $ipAddress)');
     } catch (e) {
       print('⚠️ [Heartbeat] Gagal mengirim info: $e');
+    }
+  }
+
+  /// Binds a device to the admin's OPD via `POST /api/devices/bind`.
+  ///
+  /// Requires a JWT token (from admin login).
+  /// [token] - JWT access token from admin login.
+  /// [deviceInfo] - Map containing device_sn, device_name, platform, etc.
+  ///
+  /// Returns response data map on success.
+  /// Throws [ApiError] on failure.
+  static Future<Map<String, dynamic>> bindDevice(
+    String token,
+    Map<String, dynamic> deviceInfo,
+  ) async {
+    try {
+      final bindUrl = await AppConfig.getBindUrl();
+
+      final response = await _dio.post(
+        bindUrl,
+        data: deviceInfo,
+        options: Options(
+          headers: {'Authorization': 'Bearer $token'},
+        ),
+      );
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        return response.data;
+      }
+      throw ApiError.fromStatusCode(
+        response.statusCode ?? 500,
+        serverMessage: _extractErrorMessage(response.data),
+      );
+    } on DioException catch (e) {
+      if (e.response != null) {
+        throw ApiError.fromStatusCode(
+          e.response!.statusCode ?? 500,
+          serverMessage: _extractErrorMessage(e.response?.data),
+        );
+      }
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.connectionError) {
+        throw ApiError.fromException('Tidak dapat terhubung ke server');
+      }
+      throw ApiError.fromException('Kesalahan jaringan: ${e.message}');
+    } on ApiError {
+      rethrow;
+    } catch (e) {
+      throw ApiError.fromException('Kesalahan tidak terduga: $e');
+    }
+  }
+
+  /// Biometric admin unlock via `POST /api/predict/unlock`.
+  ///
+  /// Sends face photo + device_sn. Server checks if the face belongs
+  /// to an admin authorized for this device's OPD.
+  ///
+  /// Returns response data map with `unlock`, `role`, `name`, etc.
+  /// Throws [ApiError] on failure (403 = not admin, 401 = face not recognized).
+  static Future<Map<String, dynamic>> adminUnlock(
+    File photo,
+    String deviceSn,
+  ) async {
+    try {
+      final unlockUrl = await AppConfig.getUnlockUrl();
+
+      final formData = FormData.fromMap({
+        'photo': await MultipartFile.fromFile(
+          photo.path,
+          filename: basename(photo.path),
+        ),
+        'device_sn': deviceSn,
+      });
+
+      final response = await _dio.post(unlockUrl, data: formData);
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        return response.data;
+      }
+      throw ApiError.fromStatusCode(
+        response.statusCode ?? 500,
+        serverMessage: _extractErrorMessage(response.data),
+      );
+    } on DioException catch (e) {
+      if (e.response != null) {
+        _checkDeviceNotFound(e.response?.data);
+        throw ApiError.fromStatusCode(
+          e.response!.statusCode ?? 500,
+          serverMessage: _extractErrorMessage(e.response?.data),
+        );
+      }
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.connectionError) {
+        throw ApiError.fromException('Tidak dapat terhubung ke server');
+      }
+      throw ApiError.fromException('Kesalahan jaringan: ${e.message}');
+    } on ApiError {
+      rethrow;
+    } on DeviceNotFoundException {
+      rethrow;
+    } catch (e) {
+      throw ApiError.fromException('Kesalahan tidak terduga: $e');
+    }
+  }
+
+  /// Checks if the server response contains device removal/unbind error codes.
+  /// Throws [DeviceNotFoundException] if detected.
+  static void _checkDeviceNotFound(dynamic data) {
+    if (data is Map) {
+      final errorCode = data['error'];
+      if (errorCode == 'DEVICE_NOT_FOUND' || errorCode == 'DeviceUnbound') {
+        throw DeviceNotFoundException(
+          data['message'] ?? 'Perangkat telah dihapus dari sistem. Silakan aktivasi ulang.',
+        );
+      }
     }
   }
 }

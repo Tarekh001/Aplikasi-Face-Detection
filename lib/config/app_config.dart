@@ -7,6 +7,8 @@ class AppConfig {
   // ── SharedPreferences Keys ──
   static const String _keyBaseUrl = 'base_url';
   static const String _keyDeviceSn = 'device_sn';
+  static const String _keyIsBound = 'is_bound';
+  static const String _keyBoundOpdName = 'bound_opd_name';
 
   // ── Default Values ──
   static const String defaultBaseUrl = 'http://192.168.100.57:5000';
@@ -15,6 +17,8 @@ class AppConfig {
   // ── Endpoint Constants ──
   static const String predictEndpoint = '/api/predict';
   static const String registerEndpoint = '/api/register/mobile';
+  static const String bindEndpoint = '/api/devices/bind';
+  static const String unlockEndpoint = '/api/predict/unlock';
 
   // ── Getters ──
 
@@ -28,6 +32,18 @@ class AppConfig {
   static Future<String> getDeviceSn() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_keyDeviceSn) ?? defaultDeviceSn;
+  }
+
+  /// Returns whether the device has been bound to an OPD
+  static Future<bool> getIsBound() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_keyIsBound) ?? false;
+  }
+
+  /// Returns the name of the bound OPD (for display)
+  static Future<String> getBoundOpdName() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_keyBoundOpdName) ?? '-';
   }
 
   // ── Setters ──
@@ -44,6 +60,18 @@ class AppConfig {
     await prefs.setString(_keyDeviceSn, sn);
   }
 
+  /// Saves the binding state
+  static Future<void> setIsBound(bool bound) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_keyIsBound, bound);
+  }
+
+  /// Saves the bound OPD name
+  static Future<void> setBoundOpdName(String name) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keyBoundOpdName, name);
+  }
+
   // ── Helpers ──
 
   /// Returns the full predict API URL (baseUrl + endpoint)
@@ -57,4 +85,17 @@ class AppConfig {
     final base = await getBaseUrl();
     return '$base$registerEndpoint';
   }
+
+  /// Returns the full bind API URL
+  static Future<String> getBindUrl() async {
+    final base = await getBaseUrl();
+    return '$base$bindEndpoint';
+  }
+
+  /// Returns the full unlock API URL
+  static Future<String> getUnlockUrl() async {
+    final base = await getBaseUrl();
+    return '$base$unlockEndpoint';
+  }
 }
+
