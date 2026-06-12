@@ -11,6 +11,15 @@ late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Lock orientation to portrait for kiosk tablets
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+
+  // Hide system UI for immersive kiosk mode
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+
   cameras = await availableCameras();
 
   // Kirim heartbeat ke server di background
@@ -112,6 +121,9 @@ class _KioskHomePageState extends State<KioskHomePage> {
 
   @override
   Widget build(BuildContext context) {
+    final s = MediaQuery.of(context).size.shortestSide;
+    final buttonSize = s * 0.45;
+
     return PopScope(
       canPop: false,
       child: Scaffold(
@@ -131,32 +143,32 @@ class _KioskHomePageState extends State<KioskHomePage> {
                 child: Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    const Text(
+                    Text(
                       'Sistem Presensi Untuk ASN\nKab Tangerang',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: 26,
+                        fontSize: s * 0.065,
                         fontWeight: FontWeight.bold,
                         color: Colors.white,
                       ),
                     ),
-                    const SizedBox(height: 8),
+                    SizedBox(height: s * 0.02),
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                      padding: EdgeInsets.symmetric(horizontal: s * 0.04, vertical: s * 0.015),
                       decoration: BoxDecoration(
                         color: Colors.white.withValues(alpha: 0.15),
-                        borderRadius: BorderRadius.circular(20),
+                        borderRadius: BorderRadius.circular(s * 0.05),
                       ),
                       child: Text(
                         _opdName,
-                        style: const TextStyle(
-                          fontSize: 14,
+                        style: TextStyle(
+                          fontSize: s * 0.035,
                           color: Colors.white70,
                           fontWeight: FontWeight.w500,
                         ),
                       ),
                     ),
-                    const SizedBox(height: 50),
+                    SizedBox(height: s * 0.12),
 
                     // Single large "Presensi" button
                     GestureDetector(
@@ -167,27 +179,27 @@ class _KioskHomePageState extends State<KioskHomePage> {
                         );
                       },
                       child: Container(
-                        width: 180,
-                        height: 180,
+                        width: buttonSize,
+                        height: buttonSize,
                         decoration: BoxDecoration(
                           color: Colors.white.withValues(alpha: 0.9),
-                          borderRadius: BorderRadius.circular(24),
+                          borderRadius: BorderRadius.circular(s * 0.06),
                           boxShadow: [
                             BoxShadow(
                               color: Colors.black.withValues(alpha: 0.2),
-                              blurRadius: 20,
-                              offset: const Offset(0, 8),
+                              blurRadius: s * 0.05,
+                              offset: Offset(0, s * 0.02),
                             ),
                           ],
                         ),
-                        child: const Column(
+                        child: Column(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            Icon(Icons.fingerprint, size: 64, color: Colors.deepPurple),
-                            SizedBox(height: 12),
+                            Icon(Icons.fingerprint, size: s * 0.16, color: Colors.deepPurple),
+                            SizedBox(height: s * 0.03),
                             Text('Presensi',
                                 style: TextStyle(
-                                    fontSize: 20,
+                                    fontSize: s * 0.05,
                                     fontWeight: FontWeight.bold,
                                     color: Colors.black87)),
                           ],
@@ -195,12 +207,12 @@ class _KioskHomePageState extends State<KioskHomePage> {
                       ),
                     ),
 
-                    const SizedBox(height: 30),
+                    SizedBox(height: s * 0.07),
                     Text(
                       'Menu Admin tersedia melalui verifikasi wajah\ndi halaman Presensi (ikon ⚙️)',
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        fontSize: 12,
+                        fontSize: s * 0.03,
                         color: Colors.white.withValues(alpha: 0.5),
                       ),
                     ),

@@ -20,58 +20,18 @@ class _RegisterViewState extends State<RegisterView> {
   List<File> imageFiles = [];
   bool isLoading = false;
 
-  // OPD State
-  List<dynamic> opdList = [];
-  int? selectedOpdId;
-  bool isLoadingOpd = true;
-
-  @override
-  void initState() {
-    super.initState();
-    _fetchOpdList();
-  }
-
-  Future<void> _fetchOpdList() async {
-    setState(() => isLoadingOpd = true);
-    try {
-      final list = await ApiService.fetchOpdList();
-      if (!mounted) return;
-      setState(() {
-        opdList = list.map((opd) => {
-          ...opd,
-          'id': int.parse(opd['id'].toString()),
-        }).toList();
-        if (opdList.length == 1) {
-          selectedOpdId = opdList[0]['id'] as int;
-        }
-        isLoadingOpd = false;
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() => isLoadingOpd = false);
-      debugPrint('⚠️ Gagal mengambil OPD: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Gagal memuat daftar instansi. Periksa koneksi server.'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
   Future<void> _openGuidedCamera() async {
     final frontCamera = widget.cameras.firstWhere(
       (camera) => camera.lensDirection == CameraLensDirection.front,
       orElse: () => widget.cameras.first,
     );
 
-    // Open guided camera — returns List<File> of 5 photos, or null if cancelled
     final result = await Navigator.push<List<File>?>(
       context,
       MaterialPageRoute(
         builder: (_) => GuidedCameraPage(
           camera: frontCamera,
-          startFromIndex: imageFiles.length, // resume from where we left off
+          startFromIndex: imageFiles.length,
         ),
       ),
     );
@@ -87,10 +47,6 @@ class _RegisterViewState extends State<RegisterView> {
     final name = nameController.text.trim();
     final nip = nipController.text.trim();
 
-    if (selectedOpdId == null) {
-      _showError('Pilih Instansi (OPD) terlebih dahulu');
-      return;
-    }
     if (nip.length != 18 || int.tryParse(nip) == null) {
       _showError('NIP harus 18 digit angka');
       return;
@@ -110,7 +66,6 @@ class _RegisterViewState extends State<RegisterView> {
       await ApiService.registerUser(
         name: name,
         nip: nip,
-        opdId: selectedOpdId!,
         photos: imageFiles,
       );
 
@@ -126,7 +81,6 @@ class _RegisterViewState extends State<RegisterView> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Animated checkmark circle
               Container(
                 width: 80,
                 height: 80,
@@ -144,6 +98,28 @@ class _RegisterViewState extends State<RegisterView> {
                 textAlign: TextAlign.center,
               ),
               const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(14),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.blue.shade200),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Icon(Icons.apartment_rounded, color: Colors.blue.shade700, size: 22),
+                    const SizedBox(width: 10),
+                    const Expanded(
+                      child: Text(
+                        'Instansi Anda otomatis ditentukan berdasarkan perangkat Kiosk ini.',
+                        style: TextStyle(fontSize: 13, height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
@@ -190,10 +166,7 @@ class _RegisterViewState extends State<RegisterView> {
 
       nameController.clear();
       nipController.clear();
-      setState(() {
-        imageFiles.clear();
-        selectedOpdId = opdList.length == 1 ? opdList[0]['id'] : null;
-      });
+      setState(() => imageFiles.clear());
     } on ApiError catch (e) {
       if (!mounted) return;
       _showError(e.error);
@@ -213,10 +186,6 @@ class _RegisterViewState extends State<RegisterView> {
 
   @override
   Widget build(BuildContext context) {
-    final bool formReady = selectedOpdId != null &&
-        nameController.text.trim().isNotEmpty &&
-        nipController.text.trim().length == 18;
-
     return Scaffold(
       appBar: AppBar(
         title: const Text('Register Pegawai'),
@@ -225,46 +194,40 @@ class _RegisterViewState extends State<RegisterView> {
         elevation: 0,
       ),
       body: SingleChildScrollView(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ═══ INFO BANNER: OPD Auto-Detect ═══
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+              decoration: BoxDecoration(
+                color: Colors.blue.shade50,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.blue.shade200),
+              ),
+              child: Row(
+                children: [
+                  Icon(Icons.info_outline_rounded, color: Colors.blue.shade700, size: 20),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      'Instansi (OPD) akan otomatis ditetapkan berdasarkan perangkat Kiosk ini.',
+                      style: TextStyle(fontSize: 12, color: Colors.blue.shade800, height: 1.3),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+
             // ═══ STEP 1: Data Pegawai ═══
             _buildSectionHeader('1', 'Data Pegawai', Icons.person_outline),
-            const SizedBox(height: 12),
-
-            // OPD Dropdown
-            _buildLabel('Instansi (OPD)'),
-            const SizedBox(height: 6),
-            if (isLoadingOpd)
-              _buildLoadingBox('Memuat data instansi...')
-            else if (opdList.isEmpty)
-              _buildErrorBox('Gagal memuat instansi. Ketuk untuk coba lagi.', _fetchOpdList)
-            else
-              DropdownButtonFormField<int>(
-                value: selectedOpdId,
-                isExpanded: true,
-                decoration: InputDecoration(
-                  hintText: '-- Pilih Instansi --',
-                  prefixIcon: const Icon(Icons.apartment, color: Colors.deepPurple),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 14),
-                ),
-                items: opdList.map<DropdownMenuItem<int>>((opd) {
-                  final int id = int.parse(opd['id'].toString());
-                  final String nama = opd['nama']?.toString() ?? '-';
-                  final String kode = opd['kode']?.toString() ?? '';
-                  return DropdownMenuItem<int>(
-                    value: id,
-                    child: Text('$nama ($kode)', overflow: TextOverflow.ellipsis),
-                  );
-                }).toList(),
-                onChanged: (int? v) => setState(() => selectedOpdId = v),
-              ),
-
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
 
             WidgetTemplate(label: 'Nama Lengkap', controller: nameController),
+            const SizedBox(height: 4),
             WidgetTemplate(
               label: 'NIP (18 digit)',
               controller: nipController,
@@ -272,11 +235,11 @@ class _RegisterViewState extends State<RegisterView> {
               maxLength: 18,
             ),
 
-            const SizedBox(height: 24),
+            const SizedBox(height: 28),
 
             // ═══ STEP 2: Foto Wajah ═══
             _buildSectionHeader('2', 'Foto Wajah (5 Pose)', Icons.camera_alt_outlined),
-            const SizedBox(height: 12),
+            const SizedBox(height: 14),
 
             // Photo grid with status
             if (imageFiles.isEmpty)
@@ -446,51 +409,6 @@ class _RegisterViewState extends State<RegisterView> {
         const SizedBox(width: 6),
         Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.black87)),
       ],
-    );
-  }
-
-  Widget _buildLabel(String text) {
-    return Text(text, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14, color: Colors.black87));
-  }
-
-  Widget _buildLoadingBox(String text) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
-      decoration: BoxDecoration(
-        border: Border.all(color: Colors.grey.shade300),
-        borderRadius: BorderRadius.circular(10),
-        color: Colors.grey.shade100,
-      ),
-      child: Row(
-        children: [
-          const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)),
-          const SizedBox(width: 12),
-          Text(text, style: const TextStyle(color: Colors.grey)),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildErrorBox(String text, VoidCallback onTap) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        width: double.infinity,
-        padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 12),
-        decoration: BoxDecoration(
-          border: Border.all(color: Colors.red.shade300),
-          borderRadius: BorderRadius.circular(10),
-          color: Colors.red.shade50,
-        ),
-        child: Row(
-          children: [
-            const Icon(Icons.error_outline, color: Colors.red, size: 20),
-            const SizedBox(width: 8),
-            Expanded(child: Text(text, style: const TextStyle(color: Colors.red))),
-          ],
-        ),
-      ),
     );
   }
 }

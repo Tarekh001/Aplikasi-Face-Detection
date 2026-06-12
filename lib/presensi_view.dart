@@ -17,13 +17,15 @@ import 'admin/admin_unlock_view.dart';
 import 'settings/settings_view.dart';
 
 // ═══════════════════════════════════════════════════════════════
-// STATE MACHINE — 3-Phase Liveness Pipeline
+// STATE MACHINE — 4-Phase Liveness Pipeline
 // ═══════════════════════════════════════════════════════════════
+// Phase 0: FACE_DETECTION  → ML Kit gatekeeper (idle until face found)
 // Phase 1: PASSIVE_CHECK   → Server-side MiniFASNet anti-spoofing
 // Phase 2: ACTIVE_LIVENESS → ML Kit (blink + head turn)
 // Phase 3: COUNTDOWN       → 3-2-1 → Capture → Upload
 // ═══════════════════════════════════════════════════════════════
 enum PresensiPhase {
+  faceDetection,
   passiveCheck,
   activeLiveness,
   countdown,
@@ -45,7 +47,12 @@ class _PresensiViewState extends State<PresensiView>
   late List<CameraDescription> _cameras;
 
   // ── State Machine ──
-  PresensiPhase _phase = PresensiPhase.passiveCheck;
+  PresensiPhase _phase = PresensiPhase.faceDetection;
+
+  // ── Phase 0: Face Detection Gatekeeper ──
+  bool _isFaceDetected = false;
+  bool _isGatekeeperProcessing = false;
+  bool _antiSpoofEnabled = true;  // cached from AppConfig
 
   // ── Phase 1: Passive Anti-Spoofing (Server-side) ──
   Timer? _passiveCheckTimer;
@@ -84,6 +91,9 @@ class _PresensiViewState extends State<PresensiView>
   int _emergencyTapCount = 0;
   DateTime _lastTapTime = DateTime(2000);
 
+  // ── Inactivity Timeout ──
+  Timer? _idleTimer;
+
   @override
   void initState() {
     super.initState();
@@ -91,8 +101,29 @@ class _PresensiViewState extends State<PresensiView>
       vsync: this,
       duration: const Duration(milliseconds: 1500),
     )..repeat(reverse: true);
+    _resetIdleTimer();
     _loadOpdName();
     _initializeCamera();
+  }
+
+  void _resetIdleTimer() {
+    _idleTimer?.cancel();
+    _idleTimer = Timer(const Duration(seconds: 30), () {
+      if (mounted) {
+        Navigator.pop(context);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    _idleTimer?.cancel();
+    _passiveCheckTimer?.cancel();
+    _errorResetTimer?.cancel();
+    _pulseController.dispose();
+    _cameraController?.dispose();
+    _faceDetector.close();
+    super.dispose();
   }
 
   Future<void> _loadOpdName() async {
@@ -121,11 +152,72 @@ class _PresensiViewState extends State<PresensiView>
 
       await _cameraController!.initialize();
       if (!mounted) return;
+
+      // ── Cache the anti-spoofing config once ──
+      _antiSpoofEnabled = await AppConfig.getAntiSpoofingEnabled();
+      debugPrint('🛡️ [Config] anti_spoofing_enabled = $_antiSpoofEnabled');
+
       setState(() {});
-      _startPassiveCheck();
+
+      // ── Start Phase 0: Face Detection Gatekeeper ──
+      _startFaceGatekeeper();
     } catch (e) {
       debugPrint("⚠️ Error _initializeCamera: $e");
       setState(() => _statusText = "Kamera tidak dapat diinisialisasi ❌");
+    }
+  }
+
+  // ═══════════════════════════════════════════
+  // PHASE 0: FACE DETECTION GATEKEEPER
+  // ═══════════════════════════════════════════
+  void _startFaceGatekeeper() {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) return;
+    setState(() {
+      _phase = PresensiPhase.faceDetection;
+      _isFaceDetected = false;
+      _statusText = "Arahkan wajah ke kamera 📷";
+    });
+
+    _cameraController!.startImageStream((CameraImage image) async {
+      if (_isGatekeeperProcessing || _phase != PresensiPhase.faceDetection) return;
+      _isGatekeeperProcessing = true;
+
+      try {
+        final faces = await _detectFaces(image);
+        if (!mounted || _phase != PresensiPhase.faceDetection) return;
+
+        if (faces.isNotEmpty) {
+          // Face found → stop the stream and advance
+          debugPrint('👤 [Gatekeeper] Face detected! Advancing...');
+          await _cameraController!.stopImageStream();
+          if (!mounted) return;
+          setState(() => _isFaceDetected = true);
+          _onFaceGatekeeperTriggered();
+        } else {
+          // No face — keep scanning
+          if (mounted && _phase == PresensiPhase.faceDetection) {
+            setState(() {
+              _isFaceDetected = false;
+              _statusText = "Arahkan wajah ke kamera 📷";
+            });
+          }
+        }
+      } catch (e) {
+        debugPrint('⚠️ [Gatekeeper] Error: $e');
+      }
+      _isGatekeeperProcessing = false;
+    });
+  }
+
+  /// Called once a face is detected by the gatekeeper.
+  /// Routes to the correct phase based on anti-spoofing config.
+  void _onFaceGatekeeperTriggered() {
+    if (!_antiSpoofEnabled) {
+      debugPrint('🛡️ [Gatekeeper] Anti-spoofing OFF → skip to countdown');
+      _startCountdown();
+    } else {
+      debugPrint('🛡️ [Gatekeeper] Anti-spoofing ON → start passive check');
+      _startPassiveCheck();
     }
   }
 
@@ -377,7 +469,12 @@ class _PresensiViewState extends State<PresensiView>
       _statusText = "Liveness Verified ✅";
     });
 
-    await _cameraController!.stopImageStream();
+    // Stop image stream if it was started (Phase 2 may have been skipped)
+    try {
+      await _cameraController!.stopImageStream();
+    } catch (_) {
+      // Image stream was never started (anti-spoofing bypass) — safe to ignore
+    }
 
     for (int i = 3; i >= 1; i--) {
       if (!mounted) return;
@@ -417,11 +514,7 @@ class _PresensiViewState extends State<PresensiView>
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (_) => HasilView(
-            name: result.name,
-            waktu: result.waktu,
-            status: result.status,
-          ),
+          builder: (_) => HasilView(result: result),
         ),
       );
     } on DeviceUnboundException catch (e) {
@@ -491,27 +584,30 @@ class _PresensiViewState extends State<PresensiView>
     _errorResetTimer = Timer(const Duration(seconds: 5), _resetState);
   }
 
-  void _resetState() {
+  void _resetState() async {
     if (!mounted) return;
     _errorResetTimer?.cancel();
     _passiveCheckTimer?.cancel();
 
     setState(() {
-      _phase = PresensiPhase.passiveCheck;
+      _phase = PresensiPhase.faceDetection;
+      _isFaceDetected = false;
       _hasBlinked = false;
       _hasTurnedHead = false;
       _isDetecting = false;
       _isPassiveChecking = false;
+      _isGatekeeperProcessing = false;
       _errorMessage = '';
       _livenessScore = 0.0;
       _consecutiveRealCount = 0;
-      _statusText = "Menganalisis tekstur wajah...";
+      _statusText = "Arahkan wajah ke kamera 📷";
     });
 
     if (_cameraController != null && _cameraController!.value.isInitialized) {
       try {
         try { _cameraController!.stopImageStream(); } catch (_) {}
-        _startPassiveCheck();
+        // ── Always restart from Phase 0 (Face Gatekeeper) ──
+        _startFaceGatekeeper();
       } catch (e) {
         debugPrint("⚠️ Error restarting: $e");
       }
@@ -519,16 +615,7 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   @override
-  void dispose() {
-    _errorResetTimer?.cancel();
-    _passiveCheckTimer?.cancel();
-    _pulseController.dispose();
-    if (_cameraController != null && _cameraController!.value.isInitialized) {
-      _cameraController!.dispose();
-    }
-    _faceDetector.close();
-    super.dispose();
-  }
+  
 
   // ═══════════════════════════════════════════
   // ADMIN UNLOCK — Navigate to separate view (avoids CameraException)
@@ -556,8 +643,8 @@ class _PresensiViewState extends State<PresensiView>
     // 4. Reinitialize camera when returning from admin view
     if (mounted) {
       setState(() {
-        _phase = PresensiPhase.passiveCheck;
-        _statusText = 'Menganalisis tekstur wajah...';
+        _phase = PresensiPhase.faceDetection;
+        _statusText = 'Arahkan wajah ke kamera 📷';
         _hasBlinked = false;
         _hasTurnedHead = false;
         _consecutiveRealCount = 0;
@@ -701,8 +788,8 @@ class _PresensiViewState extends State<PresensiView>
     // Reinitialize camera on return
     if (mounted) {
       setState(() {
-        _phase = PresensiPhase.passiveCheck;
-        _statusText = 'Menganalisis tekstur wajah...';
+        _phase = PresensiPhase.faceDetection;
+        _statusText = 'Arahkan wajah ke kamera 📷';
         _hasBlinked = false;
         _hasTurnedHead = false;
         _consecutiveRealCount = 0;
@@ -716,57 +803,69 @@ class _PresensiViewState extends State<PresensiView>
   // ═══════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
-    final screenHeight = MediaQuery.of(context).size.height;
-    final cameraHeight = screenHeight * 0.62;
+    final mq = MediaQuery.of(context).size;
+    final shortSide = mq.shortestSide;  // ~360 on phone, ~600+ on tablet
+    final cameraHeight = mq.height * 0.62;
+
+    // ── Responsive scale factors ──
+    final double ovalW = shortSide * 0.50;  // face guide oval width
+    final double ovalH = ovalW * 1.32;      // ~4:3 face aspect ratio
+    final double ovalRadius = ovalW * 0.55;
+    final double headerFontSize = shortSide * 0.042;
+    final double headerIconSize = shortSide * 0.055;
+    final double padH = shortSide * 0.04;   // horizontal padding
 
     return Scaffold(
       backgroundColor: const Color(0xFF1A1A2E),
-      body: SafeArea(
-        child: Column(
+      body: Listener(
+        onPointerDown: (_) => _resetIdleTimer(),
+        behavior: HitTestBehavior.translucent,
+        child: Stack(
           children: [
-            // ── TOP HEADER BAR ──
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 12, 12, 0),
-              child: Row(
+            SafeArea(
+              child: Column(
                 children: [
-                  // App branding
-                  const Icon(Icons.fingerprint, color: Colors.white, size: 22),
-                  const SizedBox(width: 8),
-                  const Expanded(
-                    child: Text('Presensi Wajah',
-                        style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.bold)),
-                  ),
-                  // Hidden admin gear (almost invisible)
-                  Opacity(
-                    opacity: 0.08,
-                    child: IconButton(
-                      icon: const Icon(Icons.settings, color: Colors.white, size: 18),
-                      onPressed: _handleAdminUnlock,
+                  // ── TOP HEADER BAR ──
+                  Padding(
+                    padding: EdgeInsets.fromLTRB(padH * 2.5, padH * 0.6, padH * 0.6, 0), // Extra left padding to avoid back button overlap
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text('Presensi Wajah',
+                              style: TextStyle(color: Colors.white, fontSize: headerFontSize, fontWeight: FontWeight.bold)),
+                        ),
+                        // Hidden admin gear (almost invisible)
+                        Opacity(
+                          opacity: 0.08,
+                          child: IconButton(
+                            icon: Icon(Icons.settings, color: Colors.white, size: headerIconSize * 0.8),
+                            onPressed: _handleAdminUnlock,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                ],
-              ),
-            ),
 
-            const SizedBox(height: 8),
+                  SizedBox(height: padH * 0.4),
 
-            // ── CAMERA CARD (top ~62%) ──
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: SizedBox(
-                height: cameraHeight,
-                child: ClipRRect(
-                  borderRadius: BorderRadius.circular(20),
-                  child: _cameraController == null || !_cameraController!.value.isInitialized
-                      ? Container(
-                          color: Colors.black,
-                          child: const Center(
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                CircularProgressIndicator(color: Colors.white54),
-                                SizedBox(height: 12),
-                                Text('Memuat kamera...', style: TextStyle(color: Colors.white54, fontSize: 13)),
+                  // ── CAMERA CARD (top ~62%) ──
+                  Padding(
+                    padding: EdgeInsets.symmetric(horizontal: padH),
+                    child: SizedBox(
+                      height: cameraHeight,
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(shortSide * 0.05),
+                        child: _cameraController == null || !_cameraController!.value.isInitialized
+                            ? Container(
+                                color: Colors.black,
+                                child: Center(
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const CircularProgressIndicator(color: Colors.white54),
+                                      SizedBox(height: padH * 0.6),
+                                      Text('Memuat kamera...',
+                                          style: TextStyle(color: Colors.white54, fontSize: shortSide * 0.032)),
                               ],
                             ),
                           ),
@@ -784,20 +883,20 @@ class _PresensiViewState extends State<PresensiView>
                               ),
                             ),
 
-                            // Oval face guide
+                            // Oval face guide (responsive)
                             Center(
                               child: AnimatedBuilder(
                                 animation: _pulseController,
                                 builder: (context, _) {
                                   return Container(
-                                    width: 220,
-                                    height: 290,
+                                    width: ovalW,
+                                    height: ovalH,
                                     decoration: BoxDecoration(
                                       border: Border.all(
                                         color: _getOvalColor(),
                                         width: 2.5 + (_pulseController.value * 0.5),
                                       ),
-                                      borderRadius: BorderRadius.circular(120),
+                                      borderRadius: BorderRadius.circular(ovalRadius),
                                     ),
                                   );
                                 },
@@ -806,7 +905,7 @@ class _PresensiViewState extends State<PresensiView>
 
                             // Phase steps indicator (top inside camera)
                             Positioned(
-                              top: 8, left: 8, right: 8,
+                              top: padH * 0.4, left: padH * 0.4, right: padH * 0.4,
                               child: _buildPhaseIndicator(),
                             ),
 
@@ -833,25 +932,25 @@ class _PresensiViewState extends State<PresensiView>
             // ── BOTTOM STATUS PANEL (~38%) ──
             Expanded(
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                padding: EdgeInsets.fromLTRB(padH, padH * 0.6, padH, padH * 0.4),
                 child: Column(
                   children: [
                     // Liveness checklist
                     _buildChecklist(),
 
-                    const SizedBox(height: 12),
+                    SizedBox(height: padH * 0.6),
 
                     // Status text
                     Container(
                       width: double.infinity,
-                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                      padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.6),
                       decoration: BoxDecoration(
                         color: Colors.white.withAlpha(12),
-                        borderRadius: BorderRadius.circular(14),
+                        borderRadius: BorderRadius.circular(shortSide * 0.035),
                         border: Border.all(color: Colors.white.withAlpha(15)),
                       ),
                       child: Text(_statusText,
-                          style: const TextStyle(color: Colors.white, fontSize: 15),
+                          style: TextStyle(color: Colors.white, fontSize: shortSide * 0.038),
                           textAlign: TextAlign.center),
                     ),
 
@@ -867,7 +966,7 @@ class _PresensiViewState extends State<PresensiView>
                           _opdName,
                           style: TextStyle(
                             color: Colors.white.withAlpha(80),
-                            fontSize: 11,
+                            fontSize: shortSide * 0.028,
                             fontWeight: FontWeight.w500,
                           ),
                           textAlign: TextAlign.center,
@@ -877,8 +976,8 @@ class _PresensiViewState extends State<PresensiView>
 
                     const SizedBox(height: 2),
                     Text(
-                      'Smart Presensi ASN — Diskominfo Kab. Tangerang',
-                      style: TextStyle(color: Colors.white.withAlpha(40), fontSize: 9),
+                      'Smart Presensi ASN \u2014 Diskominfo Kab. Tangerang',
+                      style: TextStyle(color: Colors.white.withAlpha(40), fontSize: shortSide * 0.022),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -888,14 +987,47 @@ class _PresensiViewState extends State<PresensiView>
           ],
         ),
       ),
-    );
-  }
+      
+      // Floating Back Button (Top Left)
+      Positioned(
+        top: padH * 0.4,
+        left: padH * 0.4,
+        child: SafeArea(
+          child: Material(
+            color: Colors.transparent,
+            child: InkWell(
+              onTap: () {
+                _idleTimer?.cancel();
+                Navigator.pop(context);
+              },
+              borderRadius: BorderRadius.circular(shortSide * 0.08),
+              child: Container(
+                padding: EdgeInsets.all(shortSide * 0.025),
+                decoration: const BoxDecoration(
+                  color: Colors.black54,
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(Icons.arrow_back, color: Colors.white, size: headerIconSize),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ],
+  ),
+),
+);
+}
 
   // ═══════════════════════════════════════════
   // UI WIDGETS
   // ═══════════════════════════════════════════
   Color _getOvalColor() {
     switch (_phase) {
+      case PresensiPhase.faceDetection:
+        return _isFaceDetected
+            ? Colors.greenAccent
+            : Colors.white.withValues(alpha: 0.4);
       case PresensiPhase.passiveCheck:
         return _consecutiveRealCount > 0
             ? Colors.greenAccent
@@ -912,25 +1044,33 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _buildPhaseIndicator() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      padding: EdgeInsets.symmetric(horizontal: s * 0.025, vertical: s * 0.018),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.7),
-        borderRadius: BorderRadius.circular(12),
+        borderRadius: BorderRadius.circular(s * 0.03),
       ),
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
         children: [
+          _phaseStep(Icons.face, 'Deteksi',
+              isActive: _phase == PresensiPhase.faceDetection,
+              isDone: _phase != PresensiPhase.faceDetection && _phase != PresensiPhase.error),
+          Padding(padding: EdgeInsets.only(bottom: s * 0.025),
+              child: Icon(Icons.chevron_right, color: Colors.white24, size: s * 0.04)),
           _phaseStep(Icons.shield_outlined, 'Anti-Spoof',
               isActive: _phase == PresensiPhase.passiveCheck,
-              isDone: _phase != PresensiPhase.passiveCheck && _phase != PresensiPhase.error),
-          const Padding(padding: EdgeInsets.only(bottom: 12),
-              child: Icon(Icons.chevron_right, color: Colors.white24, size: 18)),
+              isDone: _phase == PresensiPhase.activeLiveness ||
+                      _phase == PresensiPhase.countdown ||
+                      _phase == PresensiPhase.uploading),
+          Padding(padding: EdgeInsets.only(bottom: s * 0.025),
+              child: Icon(Icons.chevron_right, color: Colors.white24, size: s * 0.04)),
           _phaseStep(Icons.face_retouching_natural, 'Liveness',
               isActive: _phase == PresensiPhase.activeLiveness,
               isDone: _phase == PresensiPhase.countdown || _phase == PresensiPhase.uploading),
-          const Padding(padding: EdgeInsets.only(bottom: 12),
-              child: Icon(Icons.chevron_right, color: Colors.white24, size: 18)),
+          Padding(padding: EdgeInsets.only(bottom: s * 0.025),
+              child: Icon(Icons.chevron_right, color: Colors.white24, size: s * 0.04)),
           _phaseStep(Icons.camera_alt, 'Presensi',
               isActive: _phase == PresensiPhase.countdown || _phase == PresensiPhase.uploading,
               isDone: false),
@@ -940,23 +1080,25 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _phaseStep(IconData icon, String label, {required bool isActive, required bool isDone}) {
+    final s = MediaQuery.of(context).size.shortestSide;
     final color = isDone ? Colors.greenAccent : (isActive ? Colors.amberAccent : Colors.white30);
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(isDone ? Icons.check_circle : icon, color: color, size: 22),
-        const SizedBox(height: 2),
-        Text(label, style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+        Icon(isDone ? Icons.check_circle : icon, color: color, size: s * 0.05),
+        SizedBox(height: s * 0.005),
+        Text(label, style: TextStyle(color: color, fontSize: s * 0.026, fontWeight: FontWeight.w600)),
       ],
     );
   }
 
   Widget _buildChecklist() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding: EdgeInsets.symmetric(horizontal: s * 0.04, vertical: s * 0.025),
       decoration: BoxDecoration(
         color: Colors.white.withAlpha(15),
-        borderRadius: BorderRadius.circular(14),
+        borderRadius: BorderRadius.circular(s * 0.035),
         border: Border.all(color: Colors.white.withAlpha(10)),
       ),
       child: Row(
@@ -965,9 +1107,9 @@ class _PresensiViewState extends State<PresensiView>
           _checkItem('Anti-Spoof',
               done: _phase != PresensiPhase.passiveCheck && _phase != PresensiPhase.error,
               inProgress: _consecutiveRealCount > 0 && _phase == PresensiPhase.passiveCheck),
-          const SizedBox(width: 16),
+          SizedBox(width: s * 0.04),
           _checkItem('Kedip', done: _hasBlinked),
-          const SizedBox(width: 16),
+          SizedBox(width: s * 0.04),
           _checkItem('Putar', done: _hasTurnedHead),
         ],
       ),
@@ -975,6 +1117,7 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _checkItem(String label, {bool done = false, bool inProgress = false}) {
+    final s = MediaQuery.of(context).size.shortestSide;
     final color = done ? Colors.greenAccent : (inProgress ? Colors.amberAccent : Colors.white54);
     final icon = done
         ? Icons.check_circle
@@ -982,39 +1125,40 @@ class _PresensiViewState extends State<PresensiView>
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(icon, color: color, size: 18),
-        const SizedBox(width: 4),
-        Text(label, style: TextStyle(color: color, fontSize: 13)),
+        Icon(icon, color: color, size: s * 0.045),
+        SizedBox(width: s * 0.01),
+        Text(label, style: TextStyle(color: color, fontSize: s * 0.032)),
       ],
     );
   }
 
   Widget _buildSpoofOverlay() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
       color: Colors.red.withValues(alpha: 0.3),
       child: Center(
         child: Container(
-          margin: const EdgeInsets.symmetric(horizontal: 32),
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
+          margin: EdgeInsets.symmetric(horizontal: s * 0.08),
+          padding: EdgeInsets.symmetric(horizontal: s * 0.06, vertical: s * 0.05),
           decoration: BoxDecoration(
             color: Colors.black.withValues(alpha: 0.85),
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(s * 0.04),
             border: Border.all(color: Colors.redAccent, width: 2),
           ),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.gpp_bad, color: Colors.redAccent, size: 64),
-              const SizedBox(height: 12),
-              const Text('⚠️ SPOOFING TERDETEKSI',
-                  style: TextStyle(color: Colors.redAccent, fontSize: 22, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 8),
+              Icon(Icons.gpp_bad, color: Colors.redAccent, size: s * 0.16),
+              SizedBox(height: s * 0.03),
+              Text('\u26a0\ufe0f SPOOFING TERDETEKSI',
+                  style: TextStyle(color: Colors.redAccent, fontSize: s * 0.055, fontWeight: FontWeight.bold)),
+              SizedBox(height: s * 0.02),
               Text('Skor: ${(_livenessScore * 100).toStringAsFixed(1)}% (min. 45%)',
-                  style: const TextStyle(color: Colors.white70, fontSize: 14)),
-              const SizedBox(height: 8),
-              const Text('Gunakan wajah asli Anda.\nFoto atau layar tidak diizinkan.',
+                  style: TextStyle(color: Colors.white70, fontSize: s * 0.035)),
+              SizedBox(height: s * 0.02),
+              Text('Gunakan wajah asli Anda.\nFoto atau layar tidak diizinkan.',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white, fontSize: 16)),
+                  style: TextStyle(color: Colors.white, fontSize: s * 0.04)),
             ],
           ),
         ),
@@ -1023,15 +1167,16 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _buildCountdownOverlay() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
       color: Colors.black.withValues(alpha: 0.7),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Text('Tetap diam...',
-                style: TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w300)),
-            const SizedBox(height: 20),
+            Text('Tetap diam...',
+                style: TextStyle(color: Colors.white, fontSize: s * 0.055, fontWeight: FontWeight.w300)),
+            SizedBox(height: s * 0.05),
             TweenAnimationBuilder<double>(
               key: ValueKey(_countdownValue),
               tween: Tween(begin: 1.5, end: 1.0),
@@ -1041,7 +1186,7 @@ class _PresensiViewState extends State<PresensiView>
                 return Transform.scale(
                   scale: scale,
                   child: Text('$_countdownValue',
-                      style: const TextStyle(color: Colors.white, fontSize: 100, fontWeight: FontWeight.bold)),
+                      style: TextStyle(color: Colors.white, fontSize: s * 0.25, fontWeight: FontWeight.bold)),
                 );
               },
             ),
@@ -1052,16 +1197,17 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _buildUploadOverlay() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
       color: Colors.black.withValues(alpha: 0.7),
-      child: const Center(
+      child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            CircularProgressIndicator(color: Colors.white),
-            SizedBox(height: 20),
+            const CircularProgressIndicator(color: Colors.white),
+            SizedBox(height: s * 0.05),
             Text("Mengunggah & memproses...",
-                style: TextStyle(color: Colors.white, fontSize: 18)),
+                style: TextStyle(color: Colors.white, fontSize: s * 0.045)),
           ],
         ),
       ),
@@ -1069,34 +1215,35 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Widget _buildErrorOverlay() {
+    final s = MediaQuery.of(context).size.shortestSide;
     return Container(
       color: Colors.black.withValues(alpha: 0.85),
       child: Center(
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
+          padding: EdgeInsets.symmetric(horizontal: s * 0.08),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, color: Colors.redAccent, size: 72),
-              const SizedBox(height: 16),
+              Icon(Icons.error_outline, color: Colors.redAccent, size: s * 0.18),
+              SizedBox(height: s * 0.04),
               Text(_errorMessage,
                   textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w500)),
-              const SizedBox(height: 24),
+                  style: TextStyle(color: Colors.white, fontSize: s * 0.05, fontWeight: FontWeight.w500)),
+              SizedBox(height: s * 0.06),
               ElevatedButton.icon(
                 onPressed: _resetState,
                 icon: const Icon(Icons.refresh),
-                label: const Text('Coba Lagi', style: TextStyle(fontSize: 16)),
+                label: Text('Coba Lagi', style: TextStyle(fontSize: s * 0.04)),
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.deepPurple,
                   foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  padding: EdgeInsets.symmetric(horizontal: s * 0.08, vertical: s * 0.035),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(s * 0.03)),
                 ),
               ),
-              const SizedBox(height: 12),
-              const Text('Otomatis reset dalam 5 detik...',
-                  style: TextStyle(color: Colors.white54, fontSize: 13)),
+              SizedBox(height: s * 0.03),
+              Text('Otomatis reset dalam 5 detik...',
+                  style: TextStyle(color: Colors.white54, fontSize: s * 0.032)),
             ],
           ),
         ),

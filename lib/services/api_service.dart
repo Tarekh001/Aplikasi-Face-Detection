@@ -132,13 +132,12 @@ class ApiService {
     }
   }
 
-  /// Registers a new employee via `/api/register`.
+  /// Registers a new employee via `/api/register/mobile`.
   ///
   /// Sends multipart/form-data with:
   ///   - `name`: employee full name
   ///   - `nip`: 18-digit NIP
-  ///   - `opd_id`: the selected OPD/Instansi ID
-  ///   - `source`: 'mobile' (triggers pending approval on backend)
+  ///   - `device_sn`: kiosk serial number (OPD auto-detected by backend)
   ///   - `photos`: list of face photo files
   ///
   /// Returns the response data map on success.
@@ -146,7 +145,6 @@ class ApiService {
   static Future<Map<String, dynamic>> registerUser({
     required String name,
     required String nip,
-    required int opdId,
     required List<File> photos,
   }) async {
     try {
@@ -156,8 +154,6 @@ class ApiService {
       final formData = FormData.fromMap({
         'name': name,
         'nip': nip,
-        'opd_id': opdId,
-        'source': 'mobile',
         'device_sn': deviceSn,
         'photos': [
           for (final photo in photos)
@@ -203,26 +199,6 @@ class ApiService {
     }
   }
 
-  /// Fetches the list of OPD/Instansi from `/api/opd/list` (public, no auth).
-  /// Used by the registration form to populate the OPD dropdown.
-  /// Returns a list of maps: [{ "id": 1, "nama": "Diskominfo", "kode": "OPD-001" }]
-  static Future<List<Map<String, dynamic>>> fetchOpdList() async {
-    try {
-      final baseUrl = await AppConfig.getBaseUrl();
-      final url = '$baseUrl/api/opd/list';
-
-      final response = await _dio.get(url);
-
-      if (response.statusCode == 200 && response.data is List) {
-        return List<Map<String, dynamic>>.from(response.data);
-      }
-      return [];
-    } catch (e) {
-      print('⚠️ [OPD] Gagal mengambil daftar OPD: $e');
-      return [];
-    }
-  }
-
   /// Extracts error message from various response data formats.
   static String? _extractErrorMessage(dynamic data) {
     if (data == null) return null;
@@ -235,6 +211,7 @@ class ApiService {
   }
 
   /// Sends a background heartbeat to backend to auto-register IP, Platform, etc.
+  /// Also syncs device-level config (anti_spoofing_enabled) from server.
   static Future<void> sendHeartbeat() async {
     try {
       final baseUrl = await AppConfig.getBaseUrl();
@@ -261,13 +238,24 @@ class ApiService {
 
       // NOTE: MAC Address / Device Model are hardcoded or require external plugins.
       // Doing best-effort sending here.
-      await _dio.post(heartbeatUrl, data: {
+      final response = await _dio.post(heartbeatUrl, data: {
         'sn': deviceSn,
         'ip_address': ipAddress.isNotEmpty ? ipAddress : null,
         'platform': platformName,
         'device_name': 'Kiosk Mobile',
         // 'mac_address': 'xx:xx:xx:xx:xx' // Need network_info_plus for this
       });
+
+      // ── Sync device config from server response ──
+      if (response.statusCode == 200 && response.data != null) {
+        final data = response.data;
+        if (data['anti_spoofing_enabled'] != null) {
+          final bool serverFlag = data['anti_spoofing_enabled'] as bool;
+          await AppConfig.setAntiSpoofingEnabled(serverFlag);
+          print('🛡️ [Heartbeat] anti_spoofing_enabled synced: $serverFlag');
+        }
+      }
+
       print('✅ [Heartbeat] Berhasil update data device ke server (SN: $deviceSn, IP: $ipAddress)');
     } catch (e) {
       print('⚠️ [Heartbeat] Gagal mengirim info: $e');
