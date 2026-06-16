@@ -81,7 +81,11 @@ class ApiService {
   ///
   /// Returns [PredictResponse] on success (200).
   /// Throws [ApiError] on failure (400, 403, 500, network error).
-  static Future<PredictResponse> predictFace(File photo) async {
+  static Future<PredictResponse> predictFace(
+    File photo, {
+    double? latitude,
+    double? longitude,
+  }) async {
     try {
       final predictUrl = await AppConfig.getPredictUrl();
       final deviceSn = await AppConfig.getDeviceSn();
@@ -93,6 +97,12 @@ class ApiService {
         ),
         'device_sn': deviceSn,
       });
+
+      // Append GPS coordinates if available (geofencing support)
+      if (latitude != null && longitude != null) {
+        formData.fields.add(MapEntry('latitude_scan', latitude.toString()));
+        formData.fields.add(MapEntry('longitude_scan', longitude.toString()));
+      }
 
       final response = await _dio.post(predictUrl, data: formData);
 

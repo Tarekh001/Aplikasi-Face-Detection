@@ -1,0 +1,1 @@
+A Flutter-based kiosk application for civil servant attendance using facial recognition, multi-frame anti-spoofing, and active liveness checks.

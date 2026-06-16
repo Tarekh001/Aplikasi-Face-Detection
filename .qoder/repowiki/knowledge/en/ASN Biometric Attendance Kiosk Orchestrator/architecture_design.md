@@ -1,0 +1,4 @@
+- **Plugin-App Boundary**: The `facesdk_plugin` module provides low-level native face extraction and liveness scoring via Method Channels, consumed by the `main_app` through a singleton service (`KbyAiService`).
+- **Backend Synchronization**: The `main_app` synchronizes device state (binding, anti-spoofing flags) with a remote Flask API via `ApiService`, using a background heartbeat to maintain session validity.
+- **State-Driven Orchestration**: A centralized state machine in `PresensiView` sequences camera operations, toggling between local ML Kit checks, native SDK passive analysis, and server-side temporal verification based on runtime configuration.
+- **Hardware Isolation**: Camera resources are strictly managed across navigational boundaries (e.g., Admin Unlock, Registration) using explicit disposal and re-initialization patterns to prevent hardware contention.

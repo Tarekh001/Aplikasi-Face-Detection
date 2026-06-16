@@ -1,0 +1,11 @@
+schema_version: 1
+module_path: main_app
+title: ASN Attendance Kiosk with Liveness Detection
+scope:
+    - lib/
+    - test/
+    - android/
+    - ios/
+source_files: []
+depends_on: []
+related_to: []
