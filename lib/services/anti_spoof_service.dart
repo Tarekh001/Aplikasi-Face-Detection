@@ -15,8 +15,8 @@ class AntiSpoofService {
     receiveTimeout: const Duration(seconds: 15),
   ));
 
-  /// Threshold — server juga punya threshold sendiri
-  static const double livenessThreshold = 0.55;
+  /// Threshold — synced with backend FAS_THRESHOLD v3 (balanced)
+  static const double livenessThreshold = 0.65;
 
   /// Jumlah frame yang harus diambil
   static const int requiredFrames = 3;

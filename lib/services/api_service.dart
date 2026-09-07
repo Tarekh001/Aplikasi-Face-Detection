@@ -156,6 +156,7 @@ class ApiService {
     required String name,
     required String nip,
     required List<File> photos,
+    String role = 'ASN',
   }) async {
     try {
       final registerUrl = await AppConfig.getRegisterUrl();
@@ -165,6 +166,7 @@ class ApiService {
         'name': name,
         'nip': nip,
         'device_sn': deviceSn,
+        'role': role,
         'photos': [
           for (final photo in photos)
             await MultipartFile.fromFile(
@@ -376,6 +378,79 @@ class ApiService {
 
   /// Checks if the server response contains device removal/unbind error codes.
   /// Throws [DeviceNotFoundException] if detected.
+  // ═══════════════════════════════════════════════
+  // KEGIATAN (Activity Attendance) APIs
+  // ═══════════════════════════════════════════════
+
+  /// Fetch active kegiatan for today — `GET /api/kegiatan/active`
+  static Future<List<Map<String, dynamic>>> fetchActiveKegiatan() async {
+    try {
+      final baseUrl = await AppConfig.getBaseUrl();
+      final response = await _dio.get('$baseUrl/api/kegiatan/active');
+      if (response.statusCode == 200 && response.data is List) {
+        return List<Map<String, dynamic>>.from(response.data);
+      }
+      return [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  /// Submit kegiatan attendance — `POST /api/predict/kegiatan`
+  static Future<Map<String, dynamic>> predictKegiatan(
+    File photo, {
+    required int kegiatanId,
+    double? latitude,
+    double? longitude,
+  }) async {
+    try {
+      final baseUrl = await AppConfig.getBaseUrl();
+      final deviceSn = await AppConfig.getDeviceSn();
+
+      final formData = FormData.fromMap({
+        'photo': await MultipartFile.fromFile(photo.path, filename: basename(photo.path)),
+        'device_sn': deviceSn,
+        'kegiatan_id': kegiatanId.toString(),
+      });
+
+      if (latitude != null && longitude != null) {
+        formData.fields.add(MapEntry('latitude_scan', latitude.toString()));
+        formData.fields.add(MapEntry('longitude_scan', longitude.toString()));
+      }
+
+      final response = await _dio.post('$baseUrl/api/predict/kegiatan', data: formData);
+
+      if (response.statusCode == 200 && response.data is Map<String, dynamic>) {
+        return response.data;
+      }
+      throw ApiError.fromStatusCode(
+        response.statusCode ?? 500,
+        serverMessage: _extractErrorMessage(response.data),
+      );
+    } on DioException catch (e) {
+      if (e.response != null) {
+        // Return error response data for UI handling
+        final data = e.response?.data;
+        if (data is Map<String, dynamic>) {
+          throw ApiError.fromStatusCode(
+            e.response!.statusCode ?? 500,
+            serverMessage: data['message']?.toString() ?? data['error']?.toString() ?? 'Gagal',
+          );
+        }
+        throw ApiError.fromStatusCode(e.response!.statusCode ?? 500);
+      }
+      if (e.type == DioExceptionType.connectionError) {
+        throw ApiError.fromException('Tidak dapat terhubung ke server');
+      }
+      throw ApiError.fromException('Kesalahan jaringan: ${e.message}');
+    } on ApiError {
+      rethrow;
+    } catch (e) {
+      throw ApiError.fromException('Kesalahan: $e');
+    }
+  }
+
+  // ─── Helpers ─────────────────────────────────────
   static void _checkDeviceNotFound(dynamic data) {
     if (data is Map) {
       final errorCode = data['error'];

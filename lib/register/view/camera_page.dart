@@ -6,6 +6,7 @@ import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:path/path.dart' show join;
 import 'package:path_provider/path_provider.dart';
+import '../../config/app_theme.dart';
 
 /// Guided multi-pose camera page with oval overlay and step-by-step flow.
 /// Captures 5 photos in sequence, each with a specific pose instruction.
@@ -37,12 +38,13 @@ class _GuidedCameraPageState extends State<GuidedCameraPage>
   bool _isCapturing = false;
   bool _isDetecting = false;
 
+  // ── Pose data — clean, NO emojis, punchy human-readable instructions ──
   static const List<Map<String, dynamic>> _poses = [
-    {'label': 'Wajah Lurus & Netral', 'icon': '😐', 'desc': 'Pandang kamera dengan ekspresi netral'},
-    {'label': 'Wajah Tersenyum', 'icon': '😊', 'desc': 'Tersenyum natural ke kamera'},
-    {'label': 'Menoleh Kanan', 'icon': '👉', 'desc': 'Toleh sedikit ke kanan Anda'},
-    {'label': 'Menoleh Kiri', 'icon': '👈', 'desc': 'Toleh sedikit ke kiri Anda'},
-    {'label': 'Sedikit Mendongak', 'icon': '🔼', 'desc': 'Angkat dagu sedikit ke atas'},
+    {'label': 'Hadap Depan', 'icon': Icons.person, 'desc': 'Pandang kamera, ekspresi netral'},
+    {'label': 'Tersenyum', 'icon': Icons.sentiment_satisfied_alt, 'desc': 'Senyum natural ke kamera'},
+    {'label': 'Toleh Kanan', 'icon': Icons.turn_right, 'desc': 'Toleh sedikit ke kanan Anda'},
+    {'label': 'Toleh Kiri', 'icon': Icons.turn_left, 'desc': 'Toleh sedikit ke kiri Anda'},
+    {'label': 'Dongak Atas', 'icon': Icons.north, 'desc': 'Angkat dagu sedikit ke atas'},
   ];
 
   @override
@@ -99,7 +101,7 @@ class _GuidedCameraPageState extends State<GuidedCameraPage>
           setState(() => _isFaceDetected = faces.isNotEmpty);
         }
       } catch (e) {
-        debugPrint('⚠️ Detection tick error: $e');
+        debugPrint('Detection tick error: $e');
       }
 
       _isDetecting = false;
@@ -162,10 +164,10 @@ class _GuidedCameraPageState extends State<GuidedCameraPage>
         if (mounted) Navigator.pop(context, _capturedPhotos);
       }
     } catch (e) {
-      debugPrint('❌ Error capturing photo: $e');
+      debugPrint('Error capturing photo: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Gagal mengambil foto: $e'), backgroundColor: Colors.red),
+          SnackBar(content: Text('Gagal mengambil foto: $e'), backgroundColor: AppTheme.error),
         );
         setState(() => _isCapturing = false);
         _startPeriodicDetection();
@@ -173,218 +175,438 @@ class _GuidedCameraPageState extends State<GuidedCameraPage>
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  BUILD
+  // ═══════════════════════════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
     final pose = _poses[_currentPoseIndex];
 
     return Scaffold(
-      backgroundColor: const Color(0xFF1A1A2E),
+      extendBodyBehindAppBar: true,
+      backgroundColor: AppTheme.backgroundDark,
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1A1A2E),
+        backgroundColor: Colors.transparent,
         foregroundColor: Colors.white,
-        title: const Text('Registrasi Wajah', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Registrasi Wajah',
+          style: TextStyle(fontWeight: FontWeight.w700, fontSize: 18, letterSpacing: 0.3),
+        ),
         centerTitle: true,
         elevation: 0,
       ),
-      body: FutureBuilder<void>(
-        future: _initFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(child: CircularProgressIndicator(color: Colors.white));
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [
+              AppTheme.backgroundDark, // #0F172A
+              AppTheme.surfaceDark,    // #1E293B
+            ],
+          ),
+        ),
+        child: SafeArea(
+          child: FutureBuilder<void>(
+            future: _initFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState != ConnectionState.done) {
+                return const Center(
+                  child: CircularProgressIndicator(color: AppTheme.primary),
+                );
+              }
+
+              return OrientationBuilder(
+                builder: (context, orientation) {
+                  return LayoutBuilder(
+                    builder: (context, constraints) {
+                      final isLandscape = orientation == Orientation.landscape ||
+                          constraints.maxWidth > 700;
+
+                      if (isLandscape) {
+                        return _buildLandscapeLayout(pose, constraints);
+                      }
+                      return _buildPortraitLayout(pose, constraints);
+                    },
+                  );
+                },
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  PORTRAIT LAYOUT — Header(Progress) → Camera(Expanded) → Footer(Card+Btn)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _buildPortraitLayout(Map<String, dynamic> pose, BoxConstraints constraints) {
+    return Column(
+      children: [
+        const SizedBox(height: 8),
+
+        // ── Segmented Progress Bar ──
+        _buildSegmentedProgressBar(),
+
+        const SizedBox(height: 6),
+
+        Text(
+          'Foto ${_currentPoseIndex + 1} dari 5',
+          style: const TextStyle(
+            color: Color(0x73FFFFFF), // white 45%
+            fontSize: 13,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+
+        const SizedBox(height: 16),
+
+        // ── Camera Preview ──
+        Expanded(
+          child: Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20),
+              child: _buildCameraContainer(),
+            ),
+          ),
+        ),
+
+        // ── Bottom: Instruction Card + Capture Button ──
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildInstructionCard(pose),
+              const SizedBox(height: 20),
+              _buildCaptureButton(),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  LANDSCAPE LAYOUT — Left(Progress, Instructions, Button) → Right(Camera)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  Widget _buildLandscapeLayout(Map<String, dynamic> pose, BoxConstraints constraints) {
+    return Row(
+      children: [
+        // ── Left Pane: Controls ──
+        Expanded(
+          flex: 38,
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                const Spacer(flex: 1),
+
+                _buildSegmentedProgressBar(),
+
+                const SizedBox(height: 8),
+
+                Text(
+                  'Foto ${_currentPoseIndex + 1} dari 5',
+                  style: const TextStyle(
+                    color: Color(0x73FFFFFF), // white 45%
+                    fontSize: 13,
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+
+                const SizedBox(height: 24),
+
+                _buildInstructionCard(pose),
+
+                const SizedBox(height: 28),
+
+                _buildCaptureButton(),
+
+                const Spacer(flex: 2),
+              ],
+            ),
+          ),
+        ),
+
+        // ── Right Pane: Camera ──
+        Expanded(
+          flex: 62,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(0, 12, 24, 12),
+            child: Center(child: _buildCameraContainer()),
+          ),
+        ),
+      ],
+    );
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  //  COMPONENTS
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Segmented progress bar — 5 equal line segments with glow on active
+  Widget _buildSegmentedProgressBar() {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 40),
+      child: Row(
+        children: List.generate(5, (index) {
+          final isComplete = index < _currentPoseIndex;
+          final isCurrent = index == _currentPoseIndex;
+
+          Color segmentColor;
+          List<BoxShadow>? glow;
+
+          if (isComplete) {
+            segmentColor = AppTheme.success;
+            glow = null;
+          } else if (isCurrent) {
+            segmentColor = AppTheme.primary;
+            glow = [
+              BoxShadow(
+                color: const Color(0x802563EB), // primary 50%
+                blurRadius: 8,
+                spreadRadius: 1,
+              ),
+            ];
+          } else {
+            segmentColor = const Color(0x1FFFFFFF); // white 12%
+            glow = null;
           }
 
-          return Column(
-            children: [
-              const SizedBox(height: 8),
+          return Expanded(
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 350),
+              curve: Curves.easeOut,
+              height: 4,
+              margin: EdgeInsets.only(right: index < 4 ? 6 : 0),
+              decoration: BoxDecoration(
+                color: segmentColor,
+                borderRadius: BorderRadius.circular(2),
+                boxShadow: glow,
+              ),
+            ),
+          );
+        }),
+      ),
+    );
+  }
 
-              // ── Progress Dots ──
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: List.generate(5, (index) {
-                  final isComplete = index < _currentPoseIndex;
-                  final isCurrent = index == _currentPoseIndex;
-                  return AnimatedContainer(
-                    duration: const Duration(milliseconds: 300),
-                    margin: const EdgeInsets.symmetric(horizontal: 5),
-                    width: isCurrent ? 34 : 12,
-                    height: 12,
-                    decoration: BoxDecoration(
-                      color: isComplete
-                          ? Colors.greenAccent
-                          : isCurrent
-                              ? Colors.amberAccent
-                              : Colors.white24,
-                      borderRadius: BorderRadius.circular(6),
+  /// Camera preview with ClipRRect(32), oval overlay, and detection chip
+  Widget _buildCameraContainer() {
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(32),
+      child: AspectRatio(
+        aspectRatio: 3 / 4, // portrait 3:4
+        child: Stack(
+          fit: StackFit.expand,
+          children: [
+            // Camera feed
+            FittedBox(
+              fit: BoxFit.cover,
+              child: SizedBox(
+                width: _controller.value.previewSize?.height ?? 480,
+                height: _controller.value.previewSize?.width ?? 640,
+                child: CameraPreview(_controller),
+              ),
+            ),
+
+            // Oval overlay with pulse animation
+            AnimatedBuilder(
+              animation: _pulseController,
+              builder: (context, _) {
+                return CustomPaint(
+                  painter: _FaceOvalPainter(
+                    isFaceDetected: _isFaceDetected,
+                    pulseValue: _isFaceDetected ? 0.0 : _pulseController.value,
+                  ),
+                );
+              },
+            ),
+
+            // Face status chip — top center
+            Positioned(
+              top: 14,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 300),
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                  decoration: BoxDecoration(
+                    color: _isFaceDetected
+                        ? const Color(0xE610B981) // success 90%
+                        : const Color(0xCC334155), // slate700 80%
+                    borderRadius: BorderRadius.circular(24),
+                    border: Border.all(
+                      color: _isFaceDetected
+                          ? const Color(0x4D10B981) // success 30%
+                          : const Color(0x14FFFFFF), // white 8%
+                      width: 1,
                     ),
-                  );
-                }),
-              ),
-
-              const SizedBox(height: 6),
-
-              Text(
-                'Foto ${_currentPoseIndex + 1} dari 5',
-                style: const TextStyle(color: Colors.white54, fontSize: 13),
-              ),
-
-              const SizedBox(height: 16),
-
-              // ── Camera Preview (4:3 aspect) ──
-              Expanded(
-                child: Center(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 24),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(20),
-                      child: AspectRatio(
-                        aspectRatio: 3 / 4, // portrait 4:3
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            // Camera feed
-                            FittedBox(
-                              fit: BoxFit.cover,
-                              child: SizedBox(
-                                width: _controller.value.previewSize?.height ?? 480,
-                                height: _controller.value.previewSize?.width ?? 640,
-                                child: CameraPreview(_controller),
-                              ),
-                            ),
-
-                            // Oval overlay
-                            AnimatedBuilder(
-                              animation: _pulseController,
-                              builder: (context, _) {
-                                return CustomPaint(
-                                  painter: _FaceOvalPainter(
-                                    isFaceDetected: _isFaceDetected,
-                                    pulseValue: _isFaceDetected ? 0.0 : _pulseController.value,
-                                  ),
-                                );
-                              },
-                            ),
-
-                            // Face status indicator top-center
-                            Positioned(
-                              top: 12,
-                              left: 0,
-                              right: 0,
-                              child: Center(
-                                child: AnimatedContainer(
-                                  duration: const Duration(milliseconds: 300),
-                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: _isFaceDetected
-                                        ? Colors.green.withOpacity(0.85)
-                                        : Colors.black54,
-                                    borderRadius: BorderRadius.circular(20),
-                                  ),
-                                  child: Row(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      Icon(
-                                        _isFaceDetected ? Icons.face_retouching_natural : Icons.face,
-                                        color: Colors.white,
-                                        size: 16,
-                                      ),
-                                      const SizedBox(width: 6),
-                                      Text(
-                                        _isFaceDetected ? 'Wajah Terdeteksi' : 'Mencari wajah...',
-                                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.w600),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _isFaceDetected ? Icons.check_circle_rounded : Icons.face,
+                        color: Colors.white,
+                        size: 15,
+                      ),
+                      const SizedBox(width: 6),
+                      Text(
+                        _isFaceDetected ? 'Wajah Terdeteksi' : 'Mencari wajah...',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.2,
                         ),
                       ),
-                    ),
+                    ],
                   ),
                 ),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 
-              // ── Bottom: Pose instruction + Capture ──
-              Container(
-                padding: const EdgeInsets.fromLTRB(24, 16, 24, 32),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    // Pose info with animation
-                    AnimatedSwitcher(
-                      duration: const Duration(milliseconds: 400),
-                      transitionBuilder: (child, animation) => FadeTransition(
-                        opacity: animation,
-                        child: SlideTransition(
-                          position: Tween<Offset>(begin: const Offset(0, 0.2), end: Offset.zero)
-                              .animate(CurvedAnimation(parent: animation, curve: Curves.easeOut)),
-                          child: child,
-                        ),
-                      ),
-                      child: Column(
-                        key: ValueKey<int>(_currentPoseIndex),
-                        children: [
-                          Text(pose['icon'], style: const TextStyle(fontSize: 40)),
-                          const SizedBox(height: 4),
-                          Text(
-                            pose['label'],
-                            style: const TextStyle(color: Colors.amberAccent, fontSize: 20, fontWeight: FontWeight.bold),
-                          ),
-                          const SizedBox(height: 2),
-                          Text(pose['desc'], style: const TextStyle(color: Colors.white54, fontSize: 13)),
-                        ],
-                      ),
-                    ),
-
-                    const SizedBox(height: 20),
-
-                    // Capture button
-                    GestureDetector(
-                      onTap: (_isFaceDetected && !_isCapturing) ? _capturePhoto : null,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        width: 72,
-                        height: 72,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          border: Border.all(
-                            color: _isFaceDetected ? Colors.greenAccent : Colors.white30,
-                            width: 4,
-                          ),
-                          color: _isCapturing
-                              ? Colors.grey
-                              : _isFaceDetected
-                                  ? Colors.white
-                                  : Colors.white12,
-                          boxShadow: _isFaceDetected
-                              ? [BoxShadow(color: Colors.greenAccent.withOpacity(0.4), blurRadius: 16, spreadRadius: 2)]
-                              : [],
-                        ),
-                        child: _isCapturing
-                            ? const Padding(
-                                padding: EdgeInsets.all(18),
-                                child: CircularProgressIndicator(strokeWidth: 3, color: Colors.deepPurple),
-                              )
-                            : Icon(
-                                Icons.camera_alt_rounded,
-                                size: 32,
-                                color: _isFaceDetected ? Colors.deepPurple : Colors.white30,
-                              ),
-                      ),
-                    ),
-                  ],
-                ),
+  /// Instruction card — glassmorphic pill with icon + pose label
+  Widget _buildInstructionCard(Map<String, dynamic> pose) {
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 400),
+      transitionBuilder: (child, animation) => FadeTransition(
+        opacity: animation,
+        child: SlideTransition(
+          position: Tween<Offset>(begin: const Offset(0, 0.15), end: Offset.zero)
+              .animate(CurvedAnimation(parent: animation, curve: Curves.easeOut)),
+          child: child,
+        ),
+      ),
+      child: Container(
+        key: ValueKey<int>(_currentPoseIndex),
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+        decoration: BoxDecoration(
+          color: const Color(0x12FFFFFF), // white 7%
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: const Color(0x14FFFFFF), width: 1), // white 8%
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Pose icon in a rounded square
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(
+                color: const Color(0x262563EB), // primary 15%
+                borderRadius: BorderRadius.circular(14),
               ),
-            ],
-          );
-        },
+              child: Icon(
+                pose['icon'] as IconData,
+                color: AppTheme.primary,
+                size: 22,
+              ),
+            ),
+            const SizedBox(width: 14),
+            // Text
+            Flexible(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    '${_currentPoseIndex + 1}. ${pose['label']}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 16,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 0.1,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    pose['desc'] as String,
+                    style: const TextStyle(
+                      color: Color(0x80FFFFFF), // white 50%
+                      fontSize: 13,
+                      fontWeight: FontWeight.w400,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Modern floating capture button with soft blue shadow
+  Widget _buildCaptureButton() {
+    final isReady = _isFaceDetected && !_isCapturing;
+
+    return GestureDetector(
+      onTap: isReady ? _capturePhoto : null,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+        width: 72,
+        height: 72,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: _isCapturing
+              ? const Color(0xFF334155)
+              : isReady
+                  ? Colors.white
+                  : const Color(0x14FFFFFF), // white 8%
+          border: Border.all(
+            color: isReady
+                ? AppTheme.primary
+                : const Color(0x26FFFFFF), // white 15%
+            width: isReady ? 3.5 : 2.5,
+          ),
+          boxShadow: isReady
+              ? [
+                  const BoxShadow(
+                    color: Color(0x592563EB), // primary 35%
+                    blurRadius: 20,
+                    spreadRadius: 2,
+                  ),
+                ]
+              : [],
+        ),
+        child: _isCapturing
+            ? const Padding(
+                padding: EdgeInsets.all(18),
+                child: CircularProgressIndicator(
+                  strokeWidth: 3,
+                  color: AppTheme.primary,
+                ),
+              )
+            : Icon(
+                Icons.camera_alt_rounded,
+                size: 30,
+                color: isReady ? AppTheme.primary : const Color(0x33FFFFFF), // white 20%
+              ),
       ),
     );
   }
 }
 
-/// Oval overlay painter with animated border
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FACE OVAL OVERLAY — Refined for design system
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Oval overlay painter with animated border, aligned to AppTheme colors.
 class _FaceOvalPainter extends CustomPainter {
   final bool isFaceDetected;
   final double pulseValue;
@@ -399,29 +621,33 @@ class _FaceOvalPainter extends CustomPainter {
     final ovalRect = Rect.fromCenter(center: center, width: ovalWidth, height: ovalHeight);
 
     // Dark overlay with oval cutout
-    final overlayPaint = Paint()..color = Colors.black.withOpacity(0.5);
+    final overlayPaint = Paint()..color = const Color(0x80000000); // black 50%
     final overlayPath = Path()
       ..addRect(Rect.fromLTWH(0, 0, size.width, size.height))
       ..addOval(ovalRect)
       ..fillType = PathFillType.evenOdd;
     canvas.drawPath(overlayPath, overlayPaint);
 
-    // Oval border
+    // Oval border — success green when detected, primary blue pulse otherwise
     final borderPaint = Paint()
       ..style = PaintingStyle.stroke
-      ..strokeWidth = isFaceDetected ? 3.5 : 2.5 + (pulseValue * 1.0)
+      ..strokeWidth = isFaceDetected ? 3.0 : 2.5 + (pulseValue * 1.0)
       ..color = isFaceDetected
-          ? Colors.greenAccent
-          : Colors.amberAccent.withOpacity(0.5 + pulseValue * 0.5);
+          ? const Color(0xFF10B981) // AppTheme.success
+          : Color.lerp(
+              const Color(0x592563EB), // primary 35%
+              const Color(0xD92563EB), // primary 85%
+              pulseValue,
+            )!;
     canvas.drawOval(ovalRect, borderPaint);
 
     // Corner markers when face detected
     if (isFaceDetected) {
       final mp = Paint()
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 4
+        ..strokeWidth = 3.5
         ..strokeCap = StrokeCap.round
-        ..color = Colors.greenAccent;
+        ..color = const Color(0xFF10B981); // AppTheme.success
 
       const len = 18.0;
       // Top-left
