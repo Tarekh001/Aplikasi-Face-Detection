@@ -1,0 +1,1 @@
+Flutter (Dart) for cross-platform UI and business logic; KBY-AI Native SDK (Android/iOS) for high-performance face extraction; Flask Backend for server-side temporal anti-spoofing and identity management

@@ -1,0 +1,1 @@
+Bundled proprietary FaceSDK via Android AAR (`libfacesdk` project dependency in `android/build.gradle`) and iOS framework (`facesdk.framework` vendored in `ios/facesdk_plugin.podspec`); Kotlin 1.9.22 + Java 17 for Android; Swift 5.0 for iOS.

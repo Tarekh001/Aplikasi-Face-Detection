@@ -1,0 +1,2 @@
+- Flutter (Material 3) with `camera`, `google_mlkit_face_detection`, and `dio` for HTTP.
+- Android native integration via custom AARs (`facesdk.aar`, `fotoapparat-2.7.0.aar`) in `android/libfacesdk` and `android/libfotoapparat`.

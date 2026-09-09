@@ -1,0 +1,3 @@
+- State machines use explicit phase enums (e.g., `PresensiPhase`) to guard logic flow and prevent concurrent processing in camera streams.
+- API calls are wrapped in centralized services (`ApiService`, `AntiSpoofService`) that throw typed exceptions like `ApiError` or `DeviceUnboundException` for consistent UI error handling.
+- Camera resources are explicitly disposed and re-initialized when navigating between kiosk, admin, and settings views to prevent hardware lock conflicts.

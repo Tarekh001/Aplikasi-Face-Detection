@@ -1,0 +1,3 @@
+- Singleton pattern for shared services (KbyAiService, AppConfig, ApiService)
+- Explicit camera controller disposal before any navigation involving camera hardware
+- Centralized API error handling using custom exception types (DeviceUnboundException, ApiError)

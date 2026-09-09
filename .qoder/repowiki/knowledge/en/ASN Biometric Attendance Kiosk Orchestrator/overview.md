@@ -1,0 +1,1 @@
+Orchestrates a secure, device-bound Flutter kiosk application by integrating a native face SDK plugin with a remote Flask backend for multi-stage liveness detection and attendance management.

@@ -1,0 +1,8 @@
+schema_version: 1
+module_path: facesdk_plugin
+title: Face Detection SDK Flutter Plugin
+scope:
+    - facesdk_plugin/
+source_files: []
+depends_on: []
+related_to: []

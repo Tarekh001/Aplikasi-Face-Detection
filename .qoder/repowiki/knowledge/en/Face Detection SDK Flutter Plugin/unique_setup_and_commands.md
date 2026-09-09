@@ -1,0 +1,1 @@
+Android build requires local `libfacesdk` and `libfotoapparat` module projects referenced via `implementation project(":libfacesdk")` and `implementation project(":libfotoapparat")` in `android/build.gradle` — these are not fetched from Maven and must be present in the parent Gradle multi-project structure.

@@ -1,0 +1,5 @@
+- Entry point: `lib/main.dart` initializes immersive kiosk mode, starts a background heartbeat service, and routes via `SplashRouter` to either `ActivationView` (unbound) or `KioskHomePage` (bound).
+- Core workflow: `PresensiView` implements a 4-phase state machine (Face Detection → Passive Anti-Spoofing → Active Liveness → Countdown/Capture) before uploading to the backend.
+- Service layer: `ApiService` (Dio) handles attendance prediction, registration, and device binding; `AntiSpoofService` manages multi-frame temporal analysis requests.
+- Configuration: `AppConfig` persists device state (binding, serial number, anti-spoofing flags) using `shared_preferences`.
+- Result display: `HasilView` presents attendance outcomes (On-time, Late, Out, Unknown) with auto-return countdowns.

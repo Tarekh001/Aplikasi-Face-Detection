@@ -1,0 +1,1 @@
+A cross-platform Flutter plugin integrating a native face detection, recognition, and liveness SDK via method channels and platform views for real-time camera-based face analysis.

@@ -1,0 +1,3 @@
+- All public Dart API methods delegate through `FacesdkPluginPlatform.instance` rather than calling the method channel directly, enforcing the platform interface abstraction.
+- Native FaceSDK static method calls (e.g., `FaceSDK.faceDetection`, `FaceSDK.templateExtraction`, `FaceSDK.similarityCalculation`) are used consistently across both Android Kotlin and iOS Swift implementations without wrapper classes.
+- Face extraction results use an identical key-value map structure across platforms: `x1/y1/x2/y2` bounding box, `liveness`, `yaw/roll/pitch` pose angles, `templates` byte array, `faceJpg` encoded image, and `frameWidth/frameHeight` dimensions.
