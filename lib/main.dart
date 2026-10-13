@@ -15,9 +15,13 @@ late List<CameraDescription> cameras;
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Lock orientation to portrait for kiosk tablets
+  // Izinkan semua orientasi: tablet kiosk bisa dipakai portrait maupun landscape.
+  // (UI sudah adaptif; preview kamera mengikuti orientasi perangkat.)
   await SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
   ]);
 
   // Hide system UI for immersive kiosk mode
