@@ -1,7 +1,8 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
@@ -74,6 +75,8 @@ class _PresensiViewState extends State<PresensiView>
   bool _hasBlinked = false;
   bool _hasEyesReopened = false;  // Mata harus terbuka lagi setelah blink
   bool _hasTurnedHead = false;
+  InputImageRotation? _lastValidRotation; // Rotasi kamera yang terbukti mendeteksi wajah
+  int _noFaceConsecutiveCount = 0; // Menghindari flickering status jika 1 frame drop
 
   // ── Phase 2b: Camera Stabilization (Anti-Shake) ──
   Offset? _lastFaceCenter;        // Center of face bounding box (prev frame)
@@ -102,7 +105,113 @@ class _PresensiViewState extends State<PresensiView>
 
   // ── Inactivity Timeout ──
   Timer? _idleTimer;
-  static const int _idleTimeoutSeconds = 30;
+
+  // ── Manual Camera Rotation (untuk tablet Samsung / kiosk display) ──
+  int _manualRotationQuarterTurns = 0;
+
+  /// Restart bersih kamera dan reset state machine ke Phase 0 (Face Gatekeeper).
+  /// Menjamin stream lama dihentikan, buffer kamera bersih, dan deteksi dimulai ulang.
+  Future<void> _cleanRestartCamera() async {
+    if (!mounted) return;
+    debugPrint('🔄 [Camera] Clean restart in progress...');
+
+    _passiveCheckTimer?.cancel();
+    _errorResetTimer?.cancel();
+    _resetIdleTimer();
+
+    if (_cameraController != null && _cameraController!.value.isInitialized) {
+      try {
+        await _cameraController!.stopImageStream();
+      } catch (_) {}
+    }
+
+    if (mounted) {
+      setState(() {
+        _phase = PresensiPhase.faceDetection;
+        _isFaceDetected = false;
+        _hasBlinked = false;
+        _hasEyesReopened = false;
+        _hasTurnedHead = false;
+        _isDetecting = false;
+        _isPassiveChecking = false;
+        _isGatekeeperProcessing = false;
+        _errorMessage = '';
+        _livenessScore = 0.0;
+        _consecutiveRealCount = 0;
+        _lastFaceCenter = null;
+        _isCameraStable = true;
+        _stableFrameCount = 0;
+        _noFaceConsecutiveCount = 0;
+        _lastValidRotation = null;
+        _statusText = "Arahkan wajah ke kamera 📷";
+      });
+    }
+
+    // Delay singkat agar HAL kamera Android menyelesaikan sesi sebelumnya
+    await Future.delayed(const Duration(milliseconds: 150));
+    if (!mounted) return;
+
+    _startFaceGatekeeper();
+  }
+
+  void _toggleCameraRotation() {
+    setState(() {
+      _manualRotationQuarterTurns = (_manualRotationQuarterTurns + 1) % 4;
+      _statusText = "Menyesuaikan orientasi kamera...";
+    });
+    debugPrint('🔄 [Camera] Rotation diubah manual: ${_manualRotationQuarterTurns * 90}°');
+    _cleanRestartCamera();
+  }
+
+  int _getDisplayRotationQuarterTurns() {
+    final camera = _cameraController?.description;
+    if (camera == null) return _manualRotationQuarterTurns;
+
+    // Deteksi sensor orientation:
+    // Smartphone front camera: sensorOrientation = 270 (atau 90)
+    // Tablet Samsung front camera (di bezel landscape seperti SM-X526B): sensorOrientation = 0
+    final isTabletLandscapeSensor = camera.sensorOrientation == 0;
+    
+    // Apakah tampilan jendela/layar sedang vertikal (portrait)?
+    final isPortraitDisplay = MediaQuery.of(context).size.height >= MediaQuery.of(context).size.width;
+
+    int autoTurns = 0;
+    if (isTabletLandscapeSensor && isPortraitDisplay) {
+      // Tablet sensor landscape tapi dipakai di layar portrait (seperti Samsung SM-X526B):
+      // Putar 90 derajat searah jarum jam agar tegak
+      autoTurns = 1;
+    }
+
+    return (autoTurns + _manualRotationQuarterTurns) % 4;
+  }
+
+  /// Memastikan orientasi file foto tegak lurus (upright) sesuai tampilan.
+  /// Memutar gambar menggunakan package:image dengan EXIF baking dan rotasi tampilan.
+  Future<String> _ensureImageUpright(String imagePath) async {
+    final int quarterTurns = _getDisplayRotationQuarterTurns();
+
+    try {
+      final file = File(imagePath);
+      final bytes = await file.readAsBytes();
+      var decoded = img.decodeImage(bytes);
+      if (decoded == null) return imagePath;
+
+      // 1. Bake EXIF orientation ke raw pixels
+      decoded = img.bakeOrientation(decoded);
+
+      // 2. Terapkan rotasi kompensasi UI / sensor jika diperlukan
+      if (quarterTurns != 0) {
+        decoded = img.copyRotate(decoded, angle: quarterTurns * 90);
+      }
+
+      final rotatedBytes = img.encodeJpg(decoded, quality: 90);
+      await file.writeAsBytes(rotatedBytes);
+      return imagePath;
+    } catch (e) {
+      debugPrint("⚠️ [ImageRotate] Gagal memproses gambar $imagePath: $e");
+      return imagePath;
+    }
+  }
 
   @override
   void initState() {
@@ -116,16 +225,12 @@ class _PresensiViewState extends State<PresensiView>
     _initializeCamera();
   }
 
-  /// Reset idle timer ke 30 detik. Dipanggil setiap kali ada aktivitas user
-  /// (wajah terdeteksi, challenge aktif, dll).
+  /// Reset idle timer. DINONAKTIFKAN SEMENTARA sesuai permintaan user
+  /// agar halaman presensi tidak otomatis tertutup saat testing/kiosk.
   void _resetIdleTimer() {
     _idleTimer?.cancel();
-    _idleTimer = Timer(Duration(seconds: _idleTimeoutSeconds), () {
-      if (mounted) {
-        debugPrint('⏰ [Idle] 30s timeout — returning to home');
-        Navigator.pop(context);
-      }
-    });
+    _idleTimer = null;
+    // Auto-close dinonaktifkan sementara
   }
 
   /// Cancel idle timer sepenuhnya (saat countdown/upload/processing).
@@ -167,7 +272,10 @@ class _PresensiViewState extends State<PresensiView>
       _cameraController = CameraController(
         camera,
         ResolutionPreset.medium,
-        imageFormatGroup: ImageFormatGroup.yuv420,
+        enableAudio: false,
+        imageFormatGroup: Platform.isAndroid
+            ? ImageFormatGroup.nv21
+            : ImageFormatGroup.bgra8888,
       );
 
       await _cameraController!.initialize();
@@ -293,7 +401,8 @@ class _PresensiViewState extends State<PresensiView>
       for (int i = 0; i < AntiSpoofService.requiredFrames; i++) {
         if (!mounted || _phase != PresensiPhase.passiveCheck) break;
         final XFile xFile = await _cameraController!.takePicture();
-        framePaths.add(xFile.path);
+        final uprightPath = await _ensureImageUpright(xFile.path);
+        framePaths.add(uprightPath);
         if (i < AntiSpoofService.requiredFrames - 1) {
           await Future.delayed(
             Duration(milliseconds: AntiSpoofService.frameIntervalMs),
@@ -392,7 +501,10 @@ class _PresensiViewState extends State<PresensiView>
 
       try {
         final faces = await _detectFaces(image);
+        if (!mounted || _phase != PresensiPhase.activeLiveness) return;
+
         if (faces.isNotEmpty) {
+          _noFaceConsecutiveCount = 0;
           final Face targetFace = faces.reduce((a, b) {
             final areaA = a.boundingBox.width * a.boundingBox.height;
             final areaB = b.boundingBox.width * b.boundingBox.height;
@@ -400,7 +512,12 @@ class _PresensiViewState extends State<PresensiView>
           });
           _validateActiveLiveness(targetFace);
         } else {
-          if (mounted) setState(() => _statusText = "Tidak Ada Wajah ❌");
+          _noFaceConsecutiveCount++;
+          // Jangan langsung menghapus instruksi kedip/liveness hanya karena 1 frame drop.
+          // Hanya tampilkan peringatan jika sudah 8+ frame berturut-turut (~0.8 detik) tidak ada wajah sama sekali.
+          if (_noFaceConsecutiveCount >= 8 && mounted) {
+            setState(() => _statusText = "Arahkan wajah ke kamera 📷");
+          }
         }
       } catch (e) {
         debugPrint("⚠️ Error Face Detection: $e");
@@ -419,6 +536,17 @@ class _PresensiViewState extends State<PresensiView>
     }
   }
 
+  /// Rotasi input ML Kit yang 100% konsisten dengan rotasi visual tampilan.
+  /// Menghindari desinkronisasi atau double-counting orientasi perangkat.
+  InputImageRotation _computeInputRotation(CameraDescription camera) {
+    final effectiveQuarterTurns = _getDisplayRotationQuarterTurns();
+    final sensor = camera.sensorOrientation;
+    final degrees = camera.lensDirection == CameraLensDirection.front
+        ? (sensor + effectiveQuarterTurns * 90) % 360
+        : (sensor - effectiveQuarterTurns * 90 + 360) % 360;
+    return _rotationFromSensorOrientation(degrees);
+  }
+
   Uint8List _convertYUV420toNV21(CameraImage image) {
     final int width = image.width;
     final int height = image.height;
@@ -432,37 +560,101 @@ class _PresensiViewState extends State<PresensiView>
     int index = 0;
     for (int row = 0; row < height; row++) {
       final int rowOffset = row * planeY.bytesPerRow;
-      nv21Image.setRange(index, index + width, planeY.bytes, rowOffset);
+      if (rowOffset + width <= planeY.bytes.length) {
+        nv21Image.setRange(index, index + width, planeY.bytes, rowOffset);
+      }
       index += width;
     }
 
     final int chromaRowStride = planeU.bytesPerRow;
-    final int chromaPixelStride = planeU.bytesPerPixel!;
+    final int chromaPixelStride = planeU.bytesPerPixel ?? 1;
+    final int vLen = planeV.bytes.length;
+    final int uLen = planeU.bytes.length;
+
     for (int row = 0; row < height ~/ 2; row++) {
       for (int col = 0; col < width ~/ 2; col++) {
         final int uvOffset = row * chromaRowStride + col * chromaPixelStride;
-        nv21Image[index++] = planeV.bytes[uvOffset];
-        nv21Image[index++] = planeU.bytes[uvOffset];
+        if (uvOffset < vLen && uvOffset < uLen && index + 1 < nv21Image.length) {
+          nv21Image[index++] = planeV.bytes[uvOffset];
+          nv21Image[index++] = planeU.bytes[uvOffset];
+        }
       }
     }
     return nv21Image;
   }
 
-  Future<List<Face>> _detectFaces(CameraImage image) async {
+  InputImage? _buildInputImage(CameraImage image, InputImageRotation rotation) {
+    // 1. Jika stream kamera native NV21 (single plane)
+    if (image.planes.length == 1) {
+      final plane = image.planes.first;
+      return InputImage.fromBytes(
+        bytes: plane.bytes,
+        metadata: InputImageMetadata(
+          size: Size(image.width.toDouble(), image.height.toDouble()),
+          rotation: rotation,
+          format: InputImageFormat.nv21,
+          bytesPerRow: plane.bytesPerRow,
+        ),
+      );
+    }
+
+    // 2. Jika stream multi-plane (YUV420 fallback)
     try {
-      final camera = _cameraController!.description;
-      final rotation = _rotationFromSensorOrientation(camera.sensorOrientation);
       final nv21Bytes = _convertYUV420toNV21(image);
-      final inputImage = InputImage.fromBytes(
+      return InputImage.fromBytes(
         bytes: nv21Bytes,
         metadata: InputImageMetadata(
           size: Size(image.width.toDouble(), image.height.toDouble()),
           rotation: rotation,
           format: InputImageFormat.nv21,
-          bytesPerRow: image.planes[0].bytesPerRow,
+          bytesPerRow: image.width,
         ),
       );
-      return await _faceDetector.processImage(inputImage);
+    } catch (e) {
+      debugPrint("⚠️ Error building InputImage: $e");
+      return null;
+    }
+  }
+
+  Future<List<Face>> _detectFaces(CameraImage image) async {
+    try {
+      final camera = _cameraController!.description;
+      final defaultRotation = _computeInputRotation(camera);
+
+      // 1. Coba rotasi yang sudah terbukti mendeteksi wajah atau rotasi default tampilan
+      final primaryRotation = _lastValidRotation ?? defaultRotation;
+      final primaryInput = _buildInputImage(image, primaryRotation);
+      if (primaryInput != null) {
+        final faces = await _faceDetector.processImage(primaryInput);
+        if (faces.isNotEmpty) {
+          _lastValidRotation = primaryRotation;
+          return faces;
+        }
+      }
+
+      // 2. Jika belum menemukan wajah, lakukan probing otomatis ke 3 rotasi lainnya
+      // [0°, 90°, 270°, 180°] agar kompatibel 100% di semua device, DeX, dan Samsung Pop-up Window
+      const candidateRotations = [
+        InputImageRotation.rotation0deg,
+        InputImageRotation.rotation90deg,
+        InputImageRotation.rotation270deg,
+        InputImageRotation.rotation180deg,
+      ];
+
+      for (final rot in candidateRotations) {
+        if (rot == primaryRotation) continue;
+        final probeInput = _buildInputImage(image, rot);
+        if (probeInput != null) {
+          final probeFaces = await _faceDetector.processImage(probeInput);
+          if (probeFaces.isNotEmpty) {
+            _lastValidRotation = rot;
+            debugPrint('🎯 [MLKit] Mengunci rotasi kamera otomatis: ${rot.rawValue}°');
+            return probeFaces;
+          }
+        }
+      }
+
+      return [];
     } catch (e) {
       debugPrint("❌ _detectFaces error: $e");
       return [];
@@ -513,13 +705,24 @@ class _PresensiViewState extends State<PresensiView>
     double headTurn = face.headEulerAngleY ?? 0;
 
     // ── SEQUENTIAL Challenge: Blink FIRST, then Head Turn ──
-    // Step 1: Detect blink (both eyes < 0.3)
+    // Step 1: Detect blink (toleran untuk kacamata & kondisi pencahayaan)
     if (!_hasBlinked) {
+      bool isBlinking = false;
       if (leftEye != null && rightEye != null) {
-        if (leftEye < 0.3 && rightEye < 0.3) {
-          _hasBlinked = true;
-          debugPrint('👁️ [Liveness] Blink detected!');
+        final avgOpen = (leftEye + rightEye) / 2.0;
+        // Mata tertutup jika rata-rata < 0.35, atau salah satu mata < 0.28 (karena pantulan kacamata)
+        if (avgOpen < 0.35 || leftEye < 0.28 || rightEye < 0.28) {
+          isBlinking = true;
         }
+      } else if (leftEye != null && leftEye < 0.35) {
+        isBlinking = true;
+      } else if (rightEye != null && rightEye < 0.35) {
+        isBlinking = true;
+      }
+
+      if (isBlinking) {
+        _hasBlinked = true;
+        debugPrint('👁️ [Liveness] Blink terdeteksi! (L: $leftEye, R: $rightEye)');
       }
       if (mounted && !_hasBlinked) {
         setState(() => _statusText = 'Kedipkan mata Anda 👁️');
@@ -529,11 +732,21 @@ class _PresensiViewState extends State<PresensiView>
 
     // Step 2: Confirm eyes REOPENED after blink (anti-cheat: tutup mata terus ≠ blink)
     if (_hasBlinked && !_hasEyesReopened) {
+      bool isReopened = false;
       if (leftEye != null && rightEye != null) {
-        if (leftEye > 0.6 && rightEye > 0.6) {
-          _hasEyesReopened = true;
-          debugPrint('👁️ [Liveness] Eyes reopened — blink confirmed!');
+        final avgOpen = (leftEye + rightEye) / 2.0;
+        if (avgOpen > 0.45 || leftEye > 0.5 || rightEye > 0.5) {
+          isReopened = true;
         }
+      } else if (leftEye != null && leftEye > 0.45) {
+        isReopened = true;
+      } else if (rightEye != null && rightEye > 0.45) {
+        isReopened = true;
+      }
+
+      if (isReopened) {
+        _hasEyesReopened = true;
+        debugPrint('👁️ [Liveness] Mata terbuka kembali! (L: $leftEye, R: $rightEye)');
       }
       if (mounted && !_hasEyesReopened) {
         setState(() => _statusText = 'Buka mata Anda kembali 👀');
@@ -543,9 +756,9 @@ class _PresensiViewState extends State<PresensiView>
 
     // Step 3: Head rotation (only AFTER confirmed blink)
     if (!_hasTurnedHead) {
-      if (headTurn > 15 || headTurn < -15) {
+      if (headTurn > 12 || headTurn < -12) {
         _hasTurnedHead = true;
-        debugPrint('↔️ [Liveness] Head turn detected! (angle=$headTurn)');
+        debugPrint('↔️ [Liveness] Head turn terdeteksi! (angle=$headTurn)');
       }
       if (mounted && !_hasTurnedHead) {
         setState(() => _statusText = 'Putar kepala ke samping ↔️');
@@ -696,21 +909,25 @@ class _PresensiViewState extends State<PresensiView>
   }
 
   Future<String?> _takeAndCropFacePicture() async {
+    FaceDetector? faceDetector;
     try {
       final tempDir = await getTemporaryDirectory();
       final imagePath = join(tempDir.path, '${DateTime.now().millisecondsSinceEpoch}.jpg');
       final XFile file = await _cameraController!.takePicture();
       await file.saveTo(imagePath);
 
+      // Pastikan file foto tegak lurus sesuai orientasi tampilan sebelum crop & upload
+      await _ensureImageUpright(imagePath);
+
       final inputImage = InputImage.fromFilePath(imagePath);
       final detectorOptions = FaceDetectorOptions(
         performanceMode: FaceDetectorMode.accurate,
       );
-      final faceDetector = FaceDetector(options: detectorOptions);
+      faceDetector = FaceDetector(options: detectorOptions);
       final faces = await faceDetector.processImage(inputImage);
 
       if (faces.isEmpty) {
-        debugPrint("⚠️ No face during crop — using full image");
+        debugPrint("⚠️ [Crop] Wajah tidak terdeteksi via ML Kit saat crop — mengirim full image");
         return imagePath;
       }
 
@@ -719,24 +936,30 @@ class _PresensiViewState extends State<PresensiView>
         final areaB = b.boundingBox.width * b.boundingBox.height;
         return areaA >= areaB ? a : b;
       });
-      final boundingBox = face.boundingBox;
+      final bb = face.boundingBox;
 
       final bytes = await File(imagePath).readAsBytes();
       final originalImage = img.decodeImage(bytes);
-      if (originalImage == null) return null;
+      if (originalImage == null) return imagePath;
 
-      final x = boundingBox.left.toInt().clamp(0, originalImage.width - 1);
-      final y = boundingBox.top.toInt().clamp(0, originalImage.height - 1);
-      final width = boundingBox.width.toInt().clamp(1, originalImage.width - x);
-      final height = boundingBox.height.toInt().clamp(1, originalImage.height - y);
+      // ── CROP WAJAH PERSIS SESUAI REGISTRASI SAMPLE (PADDING 20%) ──
+      final padW = (bb.width * 0.20).toInt();
+      final padH = (bb.height * 0.20).toInt();
+      final x = (bb.left.toInt() - padW).clamp(0, originalImage.width - 1);
+      final y = (bb.top.toInt() - padH).clamp(0, originalImage.height - 1);
+      final w = (bb.width.toInt() + padW * 2).clamp(1, originalImage.width - x);
+      final h = (bb.height.toInt() + padH * 2).clamp(1, originalImage.height - y);
 
-      final cropped = img.copyCrop(originalImage, x: x, y: y, width: width, height: height);
+      final cropped = img.copyCrop(originalImage, x: x, y: y, width: w, height: h);
       final croppedPath = join(tempDir.path, 'cropped_${DateTime.now().millisecondsSinceEpoch}.jpg');
-      File(croppedPath).writeAsBytesSync(img.encodeJpg(cropped));
+      await File(croppedPath).writeAsBytes(img.encodeJpg(cropped, quality: 92));
+      debugPrint("✅ [Crop] Wajah berhasil di-crop sesuai sample: ${w}x$h px");
       return croppedPath;
     } catch (e) {
       debugPrint("❌ Error cropping wajah: $e");
       return null;
+    } finally {
+      faceDetector?.close();
     }
   }
 
@@ -790,9 +1013,6 @@ class _PresensiViewState extends State<PresensiView>
       }
     }
   }
-
-  @override
-  
 
   // ═══════════════════════════════════════════
   // ADMIN UNLOCK — Navigate to separate view (avoids CameraException)
@@ -981,16 +1201,515 @@ class _PresensiViewState extends State<PresensiView>
   @override
   Widget build(BuildContext context) {
     final mq = MediaQuery.of(context).size;
+    final isLandscape = mq.width > mq.height;
     final shortSide = mq.shortestSide;  // ~360 on phone, ~600+ on tablet
-    final cameraHeight = mq.height * 0.60;
 
     // ── Responsive scale factors ──
-    final double ovalW = shortSide * 0.50;  // face guide oval width
-    final double ovalH = ovalW * 1.32;      // ~4:3 face aspect ratio
-    final double ovalRadius = ovalW * 0.55;
     final double headerFontSize = shortSide * 0.042;
     final double headerIconSize = shortSide * 0.055;
     final double padH = shortSide * 0.04;   // horizontal padding
+
+    Widget titleText() => Text(
+          'Verifikasi Wajah Presensi',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            color: Colors.white,
+            fontSize: headerFontSize,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.3,
+          ),
+        );
+
+    // ── CAMERA CARD with Modern ClipRRect (borderRadius: 28) ──
+    Widget cameraCard({double? height}) {
+      return Container(
+        height: height,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(28),
+          border: Border.all(
+            color: _isFaceDetected
+                ? const Color(0xFF3B82F6).withValues(alpha: 0.35)
+                : Colors.white.withValues(alpha: 0.12),
+            width: 1.5,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.5),
+              blurRadius: 28,
+              offset: const Offset(0, 10),
+            ),
+            if (_isFaceDetected)
+              BoxShadow(
+                color: const Color(0xFF2563EB).withValues(alpha: 0.15),
+                blurRadius: 24,
+                spreadRadius: 2,
+              ),
+          ],
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(26),
+          child: _cameraController == null || !_cameraController!.value.isInitialized
+              ? Container(
+                  color: const Color(0xFF1E293B),
+                  child: Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const CircularProgressIndicator(color: Color(0xFF60A5FA)),
+                        SizedBox(height: padH * 0.6),
+                        Text(
+                          'Menginisialisasi kamera biometrik...',
+                          style: TextStyle(
+                            color: const Color(0xFF94A3B8),
+                            fontSize: shortSide * 0.032,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                )
+              : LayoutBuilder(
+                  builder: (context, cardConstraints) {
+                    final cardW = cardConstraints.maxWidth;
+                    // Skala oval dipatok 62% dari lebar card (bukan ukuran layar global tablet)
+                    final double localOvalW = (cardW * 0.62).clamp(160.0, 380.0);
+                    final double localOvalH = localOvalW * 1.32;
+                    final double localOvalRadius = localOvalW * 0.55;
+
+                    return Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        // Camera preview — orientation-aware, fills card without distortion
+                        _buildCameraFeed(),
+
+                        // Oval face guide (responsive terhadap ukuran card)
+                        Center(
+                          child: AnimatedBuilder(
+                            animation: _pulseController,
+                            builder: (context, _) {
+                              return Container(
+                                width: localOvalW,
+                                height: localOvalH,
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: _getOvalColor(),
+                                    width: 2.5 + (_pulseController.value * 0.5),
+                                  ),
+                                  borderRadius: BorderRadius.circular(localOvalRadius),
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+
+                        // Phase steps indicator (top inside camera — hanya di portrait)
+                        if (!isLandscape)
+                          Positioned(
+                            top: padH * 0.4,
+                            left: padH * 0.4,
+                            right: padH * 0.4,
+                            child: _buildPhaseIndicator(),
+                          ),
+
+                        // Spoof warning overlay
+                        if (_phase == PresensiPhase.passiveCheck &&
+                            _livenessScore > 0 &&
+                            _livenessScore < AntiSpoofService.livenessThreshold)
+                          _buildSpoofOverlay(),
+
+                        // Countdown overlay
+                        if (_phase == PresensiPhase.countdown) _buildCountdownOverlay(),
+
+                        // Upload overlay
+                        if (_phase == PresensiPhase.uploading) _buildUploadOverlay(),
+
+                        // Error overlay
+                        if (_phase == PresensiPhase.error) _buildErrorOverlay(),
+                      ],
+                    );
+                  },
+                ),
+        ),
+      );
+    }
+
+   
+    Widget statusCapsule() {
+      return AnimatedContainer(
+        duration: const Duration(milliseconds: 300),
+        width: double.infinity,
+        padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.55),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1E293B).withValues(alpha: 0.85),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(
+            color: _isFaceDetected
+                ? const Color(0xFF3B82F6).withValues(alpha: 0.4)
+                : Colors.white.withValues(alpha: 0.1),
+            width: 1,
+          ),
+          boxShadow: _isFaceDetected
+              ? [
+                  BoxShadow(
+                    color: const Color(0xFF2563EB).withValues(alpha: 0.18),
+                    blurRadius: 18,
+                    spreadRadius: 1,
+                  ),
+                ]
+              : [],
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(
+              _isFaceDetected
+                  ? Icons.face_retouching_natural
+                  : Icons.camera_front_rounded,
+              color: _isFaceDetected
+                  ? const Color(0xFF60A5FA)
+                  : const Color(0xFF94A3B8),
+              size: shortSide * 0.045,
+            ),
+            const SizedBox(width: 10),
+            Flexible(
+              child: Text(
+                _statusText,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: shortSide * 0.035,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.2,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    // ── Panel status (checklist + capsule + OPD + footer) ──
+    List<Widget> statusPanel(Widget gap) => [
+          // Liveness Dynamic Glowing Checklist
+          _buildChecklist(),
+
+          SizedBox(height: padH * 0.5),
+
+          statusCapsule(),
+
+          gap,
+
+          // OPD Name (7-tap emergency hatch target)
+          GestureDetector(
+            onTap: _handleEmergencyTap,
+            behavior: HitTestBehavior.opaque,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.04),
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: Colors.white.withValues(alpha: 0.06),
+                ),
+              ),
+              child: Text(
+                _opdName,
+                style: TextStyle(
+                  color: const Color(0xFF94A3B8),
+                  fontSize: shortSide * 0.028,
+                  fontWeight: FontWeight.w500,
+                ),
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 4),
+          Text(
+            'Smart Presensi ASN \u2014 Diskominfo Kab. Tangerang',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.35),
+              fontSize: shortSide * 0.022,
+            ),
+            textAlign: TextAlign.center,
+          ),
+        ];
+
+    // ── PORTRAIT: Header → Camera (Proporsional 3:4) → Status ──
+    Widget portraitBody() {
+      // Pada portrait, batasi tinggi kamera agar proporsional 3:4 (anti-gepeng di tablet & HP)
+      final double maxCardH = mq.height * 0.58;
+      final double cardW = (maxCardH * (3 / 4)).clamp(0.0, mq.width - (padH * 2));
+      final double cardH = cardW * (4 / 3);
+
+      return Column(
+        children: [
+          Padding(
+            padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.4),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [titleText()],
+            ),
+          ),
+          SizedBox(height: padH * 0.2),
+          Center(
+            child: SizedBox(
+              width: cardW,
+              height: cardH,
+              child: cameraCard(),
+            ),
+          ),
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.fromLTRB(padH, padH * 0.5, padH, padH * 0.4),
+              child: Column(
+                children: statusPanel(const Spacer()),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    // ── LANDSCAPE (tablet): Header atas rapi, Kamera kiri (proporsional), Panel status kanan ──
+    Widget landscapeBody() {
+      return Column(
+        children: [
+          // ── TOP APP BAR (Dedicated untuk mode Landscape Tablet) ──
+          Container(
+            padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.35),
+            decoration: BoxDecoration(
+              color: const Color(0xFF0F172A),
+              border: Border(
+                bottom: BorderSide(
+                  color: Colors.white.withValues(alpha: 0.08),
+                  width: 1,
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                // Tombol Kembali
+                Material(
+                  color: Colors.transparent,
+                  child: InkWell(
+                    onTap: () {
+                      _idleTimer?.cancel();
+                      Navigator.pop(context);
+                    },
+                    borderRadius: BorderRadius.circular(shortSide * 0.08),
+                    child: Container(
+                      padding: EdgeInsets.all(shortSide * 0.022),
+                      decoration: const BoxDecoration(
+                        color: Colors.black38,
+                        shape: BoxShape.circle,
+                      ),
+                      child: Icon(Icons.arrow_back_rounded, color: Colors.white, size: headerIconSize * 0.85),
+                    ),
+                  ),
+                ),
+                SizedBox(width: padH * 0.4),
+
+                // Judul & Subtitle
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        'Verifikasi Wajah Presensi',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: headerFontSize * 0.95,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: -0.3,
+                        ),
+                      ),
+                      Text(
+                        'Posisikan wajah Anda tepat di dalam area kamera untuk verifikasi biometrik',
+                        style: TextStyle(
+                          color: const Color(0xFF94A3B8),
+                          fontSize: shortSide * 0.022,
+                          fontWeight: FontWeight.w400,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+
+                // Aksi Top Bar: Refresh + Putar + Pengaturan
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // Tombol Refresh Kamera
+                    Tooltip(
+                      message: 'Refresh Kamera & Deteksi',
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _cleanRestartCamera,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.022),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.refresh_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(width: padH * 0.25),
+
+                    // Tombol Putar Kamera
+                    Tooltip(
+                      message: 'Putar Orientasi Kamera',
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _toggleCameraRotation,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.022),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.rotate_90_degrees_cw_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                    SizedBox(width: padH * 0.25),
+
+                    // Tombol Gear / Admin Unlock
+                    Tooltip(
+                      message: 'Pengaturan Kiosk',
+                      child: Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _handleAdminUnlock,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.022),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.settings_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // ── KONTEN DUA KOLOM: Kamera Kiri & Panel Status Kanan ──
+          Expanded(
+            child: Padding(
+              padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.4),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  // Kolom Kiri: Kamera (Proporsional 3:4 portrait card di dalam landscape)
+                  Expanded(
+                    flex: 5,
+                    child: Center(
+                      child: AspectRatio(
+                        aspectRatio: 3 / 4,
+                        child: cameraCard(),
+                      ),
+                    ),
+                  ),
+
+                  SizedBox(width: padH * 0.7),
+
+                  // Kolom Kanan: Panduan, Status Capsule, Checklist, OPD
+                  Expanded(
+                    flex: 5,
+                    child: Center(
+                      child: SingleChildScrollView(
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            // Tahapan Verifikasi
+                            _buildPhaseIndicator(),
+
+                            SizedBox(height: padH * 0.5),
+
+                            // Dynamic Glowing Status Capsule
+                            statusCapsule(),
+
+                            SizedBox(height: padH * 0.5),
+
+                            // Checklist Liveness
+                            _buildChecklist(),
+
+                            SizedBox(height: padH * 0.6),
+
+                            // OPD Name (7-tap emergency hatch)
+                            GestureDetector(
+                              onTap: _handleEmergencyTap,
+                              behavior: HitTestBehavior.opaque,
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                                decoration: BoxDecoration(
+                                  color: Colors.white.withValues(alpha: 0.04),
+                                  borderRadius: BorderRadius.circular(20),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: 0.06),
+                                  ),
+                                ),
+                                child: Text(
+                                  _opdName,
+                                  style: TextStyle(
+                                    color: const Color(0xFF94A3B8),
+                                    fontSize: shortSide * 0.028,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              ),
+                            ),
+
+                            const SizedBox(height: 6),
+                            Text(
+                              'Smart Presensi ASN \u2014 Diskominfo Kab. Tangerang',
+                              style: TextStyle(
+                                color: Colors.white.withValues(alpha: 0.35),
+                                fontSize: shortSide * 0.022,
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      );
+    }
 
     return Scaffold(
       backgroundColor: const Color(0xFF0F172A), // Slate 900 Pure Dark Background
@@ -1000,300 +1719,161 @@ class _PresensiViewState extends State<PresensiView>
         child: Stack(
           children: [
             SafeArea(
-              child: Column(
-                children: [
-                  // ── TOP HEADER BAR ──
-                  Padding(
-                    padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.4),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        Text(
-                          'Verifikasi Wajah Presensi',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: headerFontSize,
-                            fontWeight: FontWeight.w800,
-                            letterSpacing: -0.3,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                  SizedBox(height: padH * 0.2),
-
-                  // ── CAMERA CARD with Modern ClipRRect (borderRadius: 28) ──
-                  Padding(
-                    padding: EdgeInsets.symmetric(horizontal: padH),
-                    child: Container(
-                      height: cameraHeight,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(28),
-                        border: Border.all(
-                          color: _isFaceDetected
-                              ? const Color(0xFF3B82F6).withValues(alpha: 0.35)
-                              : Colors.white.withValues(alpha: 0.12),
-                          width: 1.5,
-                        ),
-                        boxShadow: [
-                          BoxShadow(
-                            color: Colors.black.withValues(alpha: 0.5),
-                            blurRadius: 28,
-                            offset: const Offset(0, 10),
-                          ),
-                          if (_isFaceDetected)
-                            BoxShadow(
-                              color: const Color(0xFF2563EB).withValues(alpha: 0.15),
-                              blurRadius: 24,
-                              spreadRadius: 2,
-                            ),
-                        ],
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(26),
-                        child: _cameraController == null || !_cameraController!.value.isInitialized
-                            ? Container(
-                                color: const Color(0xFF1E293B),
-                                child: Center(
-                                  child: Column(
-                                    mainAxisSize: MainAxisSize.min,
-                                    children: [
-                                      const CircularProgressIndicator(color: Color(0xFF60A5FA)),
-                                      SizedBox(height: padH * 0.6),
-                                      Text(
-                                        'Menginisialisasi kamera biometrik...',
-                                        style: TextStyle(
-                                          color: const Color(0xFF94A3B8),
-                                          fontSize: shortSide * 0.032,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              )
-                            : Stack(
-                                fit: StackFit.expand,
-                                children: [
-                                  // Camera preview — scaled to fill card
-                                  FittedBox(
-                                    fit: BoxFit.cover,
-                                    child: SizedBox(
-                                      width: _cameraController!.value.previewSize!.height,
-                                      height: _cameraController!.value.previewSize!.width,
-                                      child: CameraPreview(_cameraController!),
-                                    ),
-                                  ),
-
-                                  // Oval face guide (responsive)
-                                  Center(
-                                    child: AnimatedBuilder(
-                                      animation: _pulseController,
-                                      builder: (context, _) {
-                                        return Container(
-                                          width: ovalW,
-                                          height: ovalH,
-                                          decoration: BoxDecoration(
-                                            border: Border.all(
-                                              color: _getOvalColor(),
-                                              width: 2.5 + (_pulseController.value * 0.5),
-                                            ),
-                                            borderRadius: BorderRadius.circular(ovalRadius),
-                                          ),
-                                        );
-                                      },
-                                    ),
-                                  ),
-
-                                  // Phase steps indicator (top inside camera)
-                                  Positioned(
-                                    top: padH * 0.4,
-                                    left: padH * 0.4,
-                                    right: padH * 0.4,
-                                    child: _buildPhaseIndicator(),
-                                  ),
-
-                                  // Spoof warning overlay
-                                  if (_phase == PresensiPhase.passiveCheck &&
-                                      _livenessScore > 0 &&
-                                      _livenessScore < AntiSpoofService.livenessThreshold)
-                                    _buildSpoofOverlay(),
-
-                                  // Countdown overlay
-                                  if (_phase == PresensiPhase.countdown) _buildCountdownOverlay(),
-
-                                  // Upload overlay
-                                  if (_phase == PresensiPhase.uploading) _buildUploadOverlay(),
-
-                                  // Error overlay
-                                  if (_phase == PresensiPhase.error) _buildErrorOverlay(),
-                                ],
-                              ),
-                      ),
-                    ),
-                  ),
-
-                  // ── BOTTOM STATUS PANEL ──
-                  Expanded(
-                    child: Padding(
-                      padding: EdgeInsets.fromLTRB(padH, padH * 0.5, padH, padH * 0.4),
-                      child: Column(
-                        children: [
-                          // Liveness Dynamic Glowing Checklist
-                          _buildChecklist(),
-
-                          SizedBox(height: padH * 0.5),
-
-                          // Dynamic Glowing Status Capsule
-                          AnimatedContainer(
-                            duration: const Duration(milliseconds: 300),
-                            width: double.infinity,
-                            padding: EdgeInsets.symmetric(horizontal: padH, vertical: padH * 0.55),
-                            decoration: BoxDecoration(
-                              color: const Color(0xFF1E293B).withValues(alpha: 0.85),
-                              borderRadius: BorderRadius.circular(20),
-                              border: Border.all(
-                                color: _isFaceDetected
-                                    ? const Color(0xFF3B82F6).withValues(alpha: 0.4)
-                                    : Colors.white.withValues(alpha: 0.1),
-                                width: 1,
-                              ),
-                              boxShadow: _isFaceDetected
-                                  ? [
-                                      BoxShadow(
-                                        color: const Color(0xFF2563EB).withValues(alpha: 0.18),
-                                        blurRadius: 18,
-                                        spreadRadius: 1,
-                                      ),
-                                    ]
-                                  : [],
-                            ),
-                            child: Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                Icon(
-                                  _isFaceDetected
-                                      ? Icons.face_retouching_natural
-                                      : Icons.camera_front_rounded,
-                                  color: _isFaceDetected
-                                      ? const Color(0xFF60A5FA)
-                                      : const Color(0xFF94A3B8),
-                                  size: shortSide * 0.045,
-                                ),
-                                const SizedBox(width: 10),
-                                Flexible(
-                                  child: Text(
-                                    _statusText,
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: shortSide * 0.035,
-                                      fontWeight: FontWeight.w600,
-                                      letterSpacing: 0.2,
-                                    ),
-                                    textAlign: TextAlign.center,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-
-                          const Spacer(),
-
-                          // OPD Name (7-tap emergency hatch target)
-                          GestureDetector(
-                            onTap: _handleEmergencyTap,
-                            behavior: HitTestBehavior.opaque,
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                              decoration: BoxDecoration(
-                                color: Colors.white.withValues(alpha: 0.04),
-                                borderRadius: BorderRadius.circular(20),
-                                border: Border.all(
-                                  color: Colors.white.withValues(alpha: 0.06),
-                                ),
-                              ),
-                              child: Text(
-                                _opdName,
-                                style: TextStyle(
-                                  color: const Color(0xFF94A3B8),
-                                  fontSize: shortSide * 0.028,
-                                  fontWeight: FontWeight.w500,
-                                ),
-                                textAlign: TextAlign.center,
-                              ),
-                            ),
-                          ),
-
-                          const SizedBox(height: 4),
-                          Text(
-                            'Smart Presensi ASN \u2014 Diskominfo Kab. Tangerang',
-                            style: TextStyle(
-                              color: Colors.white.withValues(alpha: 0.35),
-                              fontSize: shortSide * 0.022,
-                            ),
-                            textAlign: TextAlign.center,
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-                ],
-              ),
+              child: isLandscape ? landscapeBody() : portraitBody(),
             ),
 
-            // ── FLOATING BACK BUTTON (TOP LEFT) ──
-            Positioned(
-              top: padH * 0.4,
-              left: padH * 0.4,
-              child: SafeArea(
-                child: Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    onTap: () {
-                      _idleTimer?.cancel();
-                      Navigator.pop(context);
-                    },
-                    borderRadius: BorderRadius.circular(shortSide * 0.08),
-                    child: Container(
-                      padding: EdgeInsets.all(shortSide * 0.025),
-                      decoration: const BoxDecoration(
-                        color: Colors.black38,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(Icons.arrow_back_rounded, color: Colors.white, size: headerIconSize * 0.85),
-                    ),
-                  ),
-                ),
-              ),
-            ),
-
-            // ── FLOATING GEAR / ADMIN AUTH BUTTON (TOP RIGHT) ──
-            Positioned(
-              top: padH * 0.4,
-              right: padH * 0.4,
-              child: SafeArea(
-                child: Material(
-                  color: Colors.transparent,
-                  child: InkWell(
-                    onTap: _handleAdminUnlock,
-                    borderRadius: BorderRadius.circular(shortSide * 0.08),
-                    child: Container(
-                      padding: EdgeInsets.all(shortSide * 0.025),
-                      decoration: const BoxDecoration(
-                        color: Colors.black38,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Icon(
-                        Icons.settings_rounded,
-                        color: Colors.white.withValues(alpha: 0.9),
-                        size: headerIconSize * 0.85,
+            // ── TOMBOL MELAYANG HANYA UNTUK MODE PORTRAIT (HP) ──
+            if (!isLandscape) ...[
+              // FLOATING BACK BUTTON (TOP LEFT)
+              Positioned(
+                top: padH * 0.4,
+                left: padH * 0.4,
+                child: SafeArea(
+                  child: Material(
+                    color: Colors.transparent,
+                    child: InkWell(
+                      onTap: () {
+                        _idleTimer?.cancel();
+                        Navigator.pop(context);
+                      },
+                      borderRadius: BorderRadius.circular(shortSide * 0.08),
+                      child: Container(
+                        padding: EdgeInsets.all(shortSide * 0.025),
+                        decoration: const BoxDecoration(
+                          color: Colors.black38,
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(Icons.arrow_back_rounded, color: Colors.white, size: headerIconSize * 0.85),
                       ),
                     ),
                   ),
                 ),
               ),
-            ),
+
+              // FLOATING BUTTONS: REFRESH, ROTATE & SETTINGS (TOP RIGHT)
+              Positioned(
+                top: padH * 0.4,
+                right: padH * 0.4,
+                child: SafeArea(
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Tombol Refresh Kamera
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _cleanRestartCamera,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.025),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.refresh_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                      SizedBox(width: padH * 0.25),
+                      // Tombol Putar Kamera
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _toggleCameraRotation,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.025),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.rotate_90_degrees_cw_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                      SizedBox(width: padH * 0.25),
+                      // Tombol Gear / Admin Unlock
+                      Material(
+                        color: Colors.transparent,
+                        child: InkWell(
+                          onTap: _handleAdminUnlock,
+                          borderRadius: BorderRadius.circular(shortSide * 0.08),
+                          child: Container(
+                            padding: EdgeInsets.all(shortSide * 0.025),
+                            decoration: const BoxDecoration(
+                              color: Colors.black38,
+                              shape: BoxShape.circle,
+                            ),
+                            child: Icon(
+                              Icons.settings_rounded,
+                              color: Colors.white.withValues(alpha: 0.9),
+                              size: headerIconSize * 0.85,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
           ],
+        ),
+      ),
+    );
+  }
+
+  /// Preview kamera yang 100% TIDAK TERDISTORSI (Anti-Gepeng) & Auto-Rotasi.
+  /// Menjamin rasio intrinsik CameraPreview dan bounding box match sempurna.
+  Widget _buildCameraFeed() {
+    if (_cameraController == null || !_cameraController!.value.isInitialized) {
+      return const SizedBox();
+    }
+
+    final int quarterTurns = _getDisplayRotationQuarterTurns();
+    final double rawAr = _cameraController!.value.aspectRatio;
+    final bool isScreenLandscape =
+        MediaQuery.of(context).size.width > MediaQuery.of(context).size.height;
+
+    // Rasio bawaan widget CameraPreview:
+    final double basePreviewRatio =
+        isScreenLandscape ? rawAr : (1.0 / rawAr);
+
+    // Rasio visual setelah rotasi:
+    final double effectiveRatio =
+        (quarterTurns % 2 == 1) ? (1.0 / basePreviewRatio) : basePreviewRatio;
+
+    Widget previewWidget = CameraPreview(_cameraController!);
+    if (quarterTurns != 0) {
+      previewWidget = RotatedBox(
+        quarterTurns: quarterTurns,
+        child: previewWidget,
+      );
+    }
+
+    // Bungkus dalam SizedBox proporsional sesuai rasio kamera yang sebenarnya,
+    // lalu OverflowBox + FittedBox(fit: BoxFit.cover) untuk mengisi card tanpa letterbox & 100% anti-gepeng
+    return ClipRect(
+      child: Center(
+        child: OverflowBox(
+          alignment: Alignment.center,
+          child: FittedBox(
+            fit: BoxFit.cover,
+            clipBehavior: Clip.hardEdge,
+            child: SizedBox(
+              width: 1000.0,
+              height: 1000.0 / effectiveRatio,
+              child: previewWidget,
+            ),
+          ),
         ),
       ),
     );
