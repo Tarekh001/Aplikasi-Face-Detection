@@ -188,23 +188,21 @@ class _PresensiViewState extends State<PresensiView>
   /// Memastikan orientasi file foto tegak lurus (upright) sesuai tampilan.
   /// Memutar gambar menggunakan package:image dengan EXIF baking dan rotasi tampilan.
   Future<String> _ensureImageUpright(String imagePath) async {
-    final int quarterTurns = _getDisplayRotationQuarterTurns();
-
     try {
       final file = File(imagePath);
       final bytes = await file.readAsBytes();
       var decoded = img.decodeImage(bytes);
       if (decoded == null) return imagePath;
 
-      // 1. Bake EXIF orientation ke raw pixels
+      // 1. Bake EXIF orientation ke raw pixels (otomatis tegak lurus sesuai sensor & device)
       decoded = img.bakeOrientation(decoded);
 
-      // 2. Terapkan rotasi kompensasi UI / sensor jika diperlukan
-      if (quarterTurns != 0) {
-        decoded = img.copyRotate(decoded, angle: quarterTurns * 90);
+      // 2. Terapkan rotasi kompensasi HANYA jika pengguna sengaja memutar kamera manual
+      if (_manualRotationQuarterTurns != 0) {
+        decoded = img.copyRotate(decoded, angle: _manualRotationQuarterTurns * 90);
       }
 
-      final rotatedBytes = img.encodeJpg(decoded, quality: 90);
+      final rotatedBytes = img.encodeJpg(decoded, quality: 95);
       await file.writeAsBytes(rotatedBytes);
       return imagePath;
     } catch (e) {
@@ -942,18 +940,46 @@ class _PresensiViewState extends State<PresensiView>
       final originalImage = img.decodeImage(bytes);
       if (originalImage == null) return imagePath;
 
-      // ── CROP WAJAH PERSIS SESUAI REGISTRASI SAMPLE (PADDING 20%) ──
-      final padW = (bb.width * 0.20).toInt();
-      final padH = (bb.height * 0.20).toInt();
-      final x = (bb.left.toInt() - padW).clamp(0, originalImage.width - 1);
-      final y = (bb.top.toInt() - padH).clamp(0, originalImage.height - 1);
-      final w = (bb.width.toInt() + padW * 2).clamp(1, originalImage.width - x);
-      final h = (bb.height.toInt() + padH * 2).clamp(1, originalImage.height - y);
+      // ── SQUARE HEAD-CENTERED CROP DENGAN 1.55x MARGIN (ANTI-POTONG DAHI & RAMBUT) ──
+      // cy digeser sedikit ke atas (0.40) agar dahi & rambut atas tidak terpotong
+      final double cx = bb.left + bb.width / 2.0;
+      final double cy = bb.top + bb.height * 0.40;
 
-      final cropped = img.copyCrop(originalImage, x: x, y: y, width: w, height: h);
+      final double maxSide = bb.width > bb.height ? bb.width : bb.height;
+      final int side = (maxSide * 1.55).round().clamp(140, originalImage.height);
+
+      int x1 = (cx - side / 2.0).round();
+      int y1 = (cy - side / 2.0).round();
+      int x2 = x1 + side;
+      int y2 = y1 + side;
+
+      // Geser jendela crop agar tetap 1:1 di dalam gambar tanpa memotong kepala
+      if (x1 < 0) {
+        x2 -= x1;
+        x1 = 0;
+      }
+      if (y1 < 0) {
+        y2 -= y1;
+        y1 = 0;
+      }
+      if (x2 > originalImage.width) {
+        final shift = x2 - originalImage.width;
+        x1 = (x1 - shift).clamp(0, originalImage.width);
+        x2 = originalImage.width;
+      }
+      if (y2 > originalImage.height) {
+        final shift = y2 - originalImage.height;
+        y1 = (y1 - shift).clamp(0, originalImage.height);
+        y2 = originalImage.height;
+      }
+
+      final int width = (x2 - x1).clamp(1, originalImage.width);
+      final int height = (y2 - y1).clamp(1, originalImage.height);
+
+      final cropped = img.copyCrop(originalImage, x: x1, y: y1, width: width, height: height);
       final croppedPath = join(tempDir.path, 'cropped_${DateTime.now().millisecondsSinceEpoch}.jpg');
-      await File(croppedPath).writeAsBytes(img.encodeJpg(cropped, quality: 92));
-      debugPrint("✅ [Crop] Wajah berhasil di-crop sesuai sample: ${w}x$h px");
+      await File(croppedPath).writeAsBytes(img.encodeJpg(cropped, quality: 95));
+      debugPrint("✅ [Crop] Wajah berhasil di-crop 1:1 persegi: ${width}x$height px");
       return croppedPath;
     } catch (e) {
       debugPrint("❌ Error cropping wajah: $e");
@@ -1841,26 +1867,15 @@ class _PresensiViewState extends State<PresensiView>
     final int quarterTurns = _getDisplayRotationQuarterTurns();
     final double rawAr = _cameraController!.value.aspectRatio;
     final bool isScreenLandscape =
-        MediaQuery.of(context).size.width > MediaQuery.of(context).size.height;
+        MediaQuery.of(context).orientation == Orientation.landscape;
 
-    // Rasio bawaan widget CameraPreview:
-    final double basePreviewRatio =
+    // Aspect ratio intrinsik yang dipaksakan oleh widget CameraPreview:
+    final double cameraPreviewRatio =
         isScreenLandscape ? rawAr : (1.0 / rawAr);
 
-    // Rasio visual setelah rotasi:
-    final double effectiveRatio =
-        (quarterTurns % 2 == 1) ? (1.0 / basePreviewRatio) : basePreviewRatio;
-
-    Widget previewWidget = CameraPreview(_cameraController!);
-    if (quarterTurns != 0) {
-      previewWidget = RotatedBox(
-        quarterTurns: quarterTurns,
-        child: previewWidget,
-      );
-    }
-
-    // Bungkus dalam SizedBox proporsional sesuai rasio kamera yang sebenarnya,
-    // lalu OverflowBox + FittedBox(fit: BoxFit.cover) untuk mengisi card tanpa letterbox & 100% anti-gepeng
+    // Menghilangkan letterbox total: SizedBox memiliki rasio PERSIS sama dengan CameraPreview
+    // lalu diputar dengan RotatedBox dan discale oleh FittedBox(fit: BoxFit.cover)
+    // sehingga 100% card terisi penuh tanpa garis hitam dan 100% anti-gepeng di HP maupun Tablet.
     return ClipRect(
       child: Center(
         child: OverflowBox(
@@ -1868,10 +1883,13 @@ class _PresensiViewState extends State<PresensiView>
           child: FittedBox(
             fit: BoxFit.cover,
             clipBehavior: Clip.hardEdge,
-            child: SizedBox(
-              width: 1000.0,
-              height: 1000.0 / effectiveRatio,
-              child: previewWidget,
+            child: RotatedBox(
+              quarterTurns: quarterTurns,
+              child: SizedBox(
+                width: 1000.0,
+                height: 1000.0 / cameraPreviewRatio,
+                child: CameraPreview(_cameraController!),
+              ),
             ),
           ),
         ),

@@ -134,19 +134,49 @@ class _GuidedCameraPageState extends State<GuidedCameraPage>
       if (faces.isNotEmpty) {
         final bb = faces.first.boundingBox;
         final bytes = await File(imagePath).readAsBytes();
-        final originalImage = img.decodeImage(bytes);
+        var originalImage = img.decodeImage(bytes);
 
         if (originalImage != null) {
-          final padW = (bb.width * 0.20).toInt();
-          final padH = (bb.height * 0.20).toInt();
-          final x = (bb.left.toInt() - padW).clamp(0, originalImage.width - 1);
-          final y = (bb.top.toInt() - padH).clamp(0, originalImage.height - 1);
-          final w = (bb.width.toInt() + padW * 2).clamp(1, originalImage.width - x);
-          final h = (bb.height.toInt() + padH * 2).clamp(1, originalImage.height - y);
+          // 1. Bake EXIF orientation agar koordinat bounding box cocok dengan pixel citra
+          originalImage = img.bakeOrientation(originalImage);
 
-          final cropped = img.copyCrop(originalImage, x: x, y: y, width: w, height: h);
-          final croppedPath = join(directory.path, 'crop_${DateTime.now().millisecondsSinceEpoch}.png');
-          File(croppedPath).writeAsBytesSync(img.encodePng(cropped));
+          // 2. Square head-centered crop dengan margin 1.55x (anti-potong dahi & rambut)
+          final double cx = bb.left + bb.width / 2.0;
+          final double cy = bb.top + bb.height * 0.40;
+
+          final double maxSide = bb.width > bb.height ? bb.width : bb.height;
+          final int side = (maxSide * 1.55).round().clamp(140, originalImage.height);
+
+          int x1 = (cx - side / 2.0).round();
+          int y1 = (cy - side / 2.0).round();
+          int x2 = x1 + side;
+          int y2 = y1 + side;
+
+          if (x1 < 0) {
+            x2 -= x1;
+            x1 = 0;
+          }
+          if (y1 < 0) {
+            y2 -= y1;
+            y1 = 0;
+          }
+          if (x2 > originalImage.width) {
+            final shift = x2 - originalImage.width;
+            x1 = (x1 - shift).clamp(0, originalImage.width);
+            x2 = originalImage.width;
+          }
+          if (y2 > originalImage.height) {
+            final shift = y2 - originalImage.height;
+            y1 = (y1 - shift).clamp(0, originalImage.height);
+            y2 = originalImage.height;
+          }
+
+          final int width = (x2 - x1).clamp(1, originalImage.width);
+          final int height = (y2 - y1).clamp(1, originalImage.height);
+
+          final cropped = img.copyCrop(originalImage, x: x1, y: y1, width: width, height: height);
+          final croppedPath = join(directory.path, 'crop_${DateTime.now().millisecondsSinceEpoch}.jpg');
+          File(croppedPath).writeAsBytesSync(img.encodeJpg(cropped, quality: 95));
           finalPath = croppedPath;
         }
       }

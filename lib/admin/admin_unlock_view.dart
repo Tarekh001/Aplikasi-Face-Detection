@@ -286,8 +286,10 @@ class _AdminUnlockViewState extends State<AdminUnlockView>
                                         builder: (context, cameraConstraints) {
                                           final camVal = _cameraController!.value;
                                           // Camera aspect ratio in portrait orientation
+                                          final isScreenLandscape =
+                                              MediaQuery.of(context).orientation == Orientation.landscape;
                                           final previewRatio = camVal.isInitialized
-                                              ? 1.0 / camVal.aspectRatio
+                                              ? (isScreenLandscape ? camVal.aspectRatio : (1.0 / camVal.aspectRatio))
                                               : 1.0;
                                           return OverflowBox(
                                             alignment: Alignment.center,
