@@ -67,7 +67,7 @@ class _RegisterViewState extends State<RegisterView> {
     setState(() => isLoading = true);
 
     try {
-      await ApiService.registerUser(
+      final res = await ApiService.registerUser(
         name: name,
         nip: nip,
         photos: imageFiles,
@@ -76,39 +76,269 @@ class _RegisterViewState extends State<RegisterView> {
 
       if (!mounted) return;
 
-      // Modern Success Dialog
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (ctx) => AlertDialog(
-          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-          backgroundColor: Colors.white,
-          surfaceTintColor: Colors.transparent,
-          contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 16),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
+      // ── TAHAP 1: Server Meminta Konfirmasi Re-Registrasi Wajah ──
+      if (res['needs_confirmation'] == true) {
+        setState(() => isLoading = false);
+        final confirmed = await _showReregisterConfirmationDialog(
+          name: res['name']?.toString() ?? name,
+          nip: nip,
+          similarityPct: res['similarity_pct'] != null
+              ? (res['similarity_pct'] as num).toDouble()
+              : null,
+          message: res['message']?.toString() ?? '',
+        );
+
+        if (confirmed == true && mounted) {
+          // ── TAHAP 2: Pengguna Setuju -> Kirim confirmReregister = true ──
+          setState(() => isLoading = true);
+          final reregRes = await ApiService.registerUser(
+            name: name,
+            nip: nip,
+            photos: imageFiles,
+            role: _selectedMode,
+            confirmReregister: true,
+          );
+
+          if (!mounted) return;
+          _showSuccessDialog(
+            isReregister: true,
+            name: name,
+            message: reregRes['message']?.toString(),
+          );
+          nameController.clear();
+          nipController.clear();
+          setState(() => imageFiles.clear());
+        }
+        return;
+      }
+
+      // Registrasi Baru Standar
+      _showSuccessDialog(
+        isReregister: false,
+        name: name,
+        message: res['message']?.toString(),
+      );
+      nameController.clear();
+      nipController.clear();
+      setState(() => imageFiles.clear());
+    } on ApiError catch (e) {
+      if (!mounted) return;
+      _showError(e.error);
+    } catch (e) {
+      if (!mounted) return;
+      _showError('Terjadi kendala: $e');
+    } finally {
+      if (mounted) setState(() => isLoading = false);
+    }
+  }
+
+
+  /// Dialog pengingat / konfirmasi re-registrasi wajah (Biometric Re-Enrollment)
+  Future<bool?> _showReregisterConfirmationDialog({
+    required String name,
+    required String nip,
+    double? similarityPct,
+    required String message,
+  }) {
+    return showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 20),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFFEFF6FF),
+                border: Border.all(color: const Color(0xFFBFDBFE), width: 2),
+              ),
+              child: const Icon(
+                Icons.face_retouching_natural_rounded,
+                color: Color(0xFF2563EB),
+                size: 40,
+              ),
+            ),
+            const SizedBox(height: 18),
+            const Text(
+              'Konfirmasi Pembaruan Wajah',
+              style: TextStyle(
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF0F172A),
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            if (similarityPct != null)
               Container(
-                width: 72,
-                height: 72,
+                margin: const EdgeInsets.only(bottom: 12),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                 decoration: BoxDecoration(
-                  shape: BoxShape.circle,
                   color: const Color(0xFFECFDF5),
-                  border: Border.all(color: const Color(0xFFA7F3D0), width: 2),
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: const Color(0xFFA7F3D0)),
                 ),
-                child: const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 44),
-              ),
-              const SizedBox(height: 18),
-              const Text(
-                'Registrasi Berhasil!',
-                style: TextStyle(
-                  fontSize: 19,
-                  fontWeight: FontWeight.w800,
-                  color: Color(0xFF0F172A),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.verified_rounded, color: Color(0xFF10B981), size: 16),
+                    const SizedBox(width: 6),
+                    Text(
+                      'Wajah Terverifikasi: ${similarityPct.toStringAsFixed(1)}%',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF047857),
+                      ),
+                    ),
+                  ],
                 ),
-                textAlign: TextAlign.center,
               ),
-              const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF8FAFC),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFE2E8F0)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'NIP $nip sudah terdaftar atas nama $name.',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF1E293B),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  const Text(
+                    'Apakah Anda yakin ingin memperbarui data sampel biometrik wajah Anda dengan 5 foto baru ini? Data foto lama akan digantikan dan wajah baru langsung aktif untuk presensi.',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Color(0xFF64748B),
+                      height: 1.45,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton(
+                    onPressed: () => Navigator.of(ctx).pop(false),
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                      side: const BorderSide(color: Color(0xFFCBD5E1)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: const Text(
+                      'Batal',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        color: Color(0xFF64748B),
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  flex: 2,
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.of(ctx).pop(true),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF2563EB),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 13),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      elevation: 0,
+                    ),
+                    child: const Text(
+                      'Ya, Perbarui Wajah',
+                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Dialog sukses registrasi baru maupun re-registrasi wajah
+  void _showSuccessDialog({
+    required bool isReregister,
+    required String name,
+    String? message,
+  }) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        contentPadding: const EdgeInsets.fromLTRB(24, 28, 24, 16),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 72,
+              height: 72,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFFECFDF5),
+                border: Border.all(color: const Color(0xFFA7F3D0), width: 2),
+              ),
+              child: const Icon(Icons.check_circle_rounded, color: Color(0xFF10B981), size: 44),
+            ),
+            const SizedBox(height: 18),
+            Text(
+              isReregister ? 'Wajah Berhasil Diperbarui!' : 'Registrasi Berhasil!',
+              style: const TextStyle(
+                fontSize: 19,
+                fontWeight: FontWeight.w800,
+                color: Color(0xFF0F172A),
+              ),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 14),
+            if (isReregister)
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFECFDF5),
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFFA7F3D0)),
+                ),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.verified_rounded, color: Color(0xFF10B981), size: 20),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(
+                        'Data sampel wajah untuk $name telah diperbarui dan langsung aktif untuk presensi.',
+                        style: const TextStyle(fontSize: 12, color: Color(0xFF047857), height: 1.4),
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            else ...[
               Container(
                 padding: const EdgeInsets.all(12),
                 decoration: BoxDecoration(
@@ -152,41 +382,29 @@ class _RegisterViewState extends State<RegisterView> {
                   ],
                 ),
               ),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  onPressed: () {
-                    Navigator.of(ctx).pop();
-                    Navigator.of(context).pop();
-                  },
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2563EB),
-                    foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    elevation: 0,
-                  ),
-                  child: const Text('Selesai & Kembali', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
-                ),
-              ),
             ],
-          ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () {
+                  Navigator.of(ctx).pop();
+                  Navigator.of(context).pop();
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF2563EB),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  elevation: 0,
+                ),
+                child: const Text('Selesai & Kembali', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+              ),
+            ),
+          ],
         ),
-      );
-
-      nameController.clear();
-      nipController.clear();
-      setState(() => imageFiles.clear());
-    } on ApiError catch (e) {
-      if (!mounted) return;
-      _showError(e.error);
-    } catch (e) {
-      if (!mounted) return;
-      _showError('Terjadi kendala: $e');
-    } finally {
-      if (mounted) setState(() => isLoading = false);
-    }
+      ),
+    );
   }
 
   void _showError(String message) {

@@ -157,12 +157,13 @@ class ApiService {
     required String nip,
     required List<File> photos,
     String role = 'ASN',
+    bool confirmReregister = false,
   }) async {
     try {
       final registerUrl = await AppConfig.getRegisterUrl();
       final deviceSn = await AppConfig.getDeviceSn();
 
-      final formData = FormData.fromMap({
+      final Map<String, dynamic> dataMap = {
         'name': name,
         'nip': nip,
         'device_sn': deviceSn,
@@ -174,7 +175,13 @@ class ApiService {
               filename: basename(photo.path),
             ),
         ],
-      });
+      };
+
+      if (confirmReregister) {
+        dataMap['confirm_reregister'] = 'true';
+      }
+
+      final formData = FormData.fromMap(dataMap);
 
       final response = await _dio.post(registerUrl, data: formData);
 
