@@ -32,6 +32,7 @@ class _RegisterViewState extends State<RegisterView> {
       MaterialPageRoute(
         builder: (_) => GuidedCameraPage(
           camera: frontCamera,
+          cameras: widget.cameras,
           startFromIndex: imageFiles.length,
         ),
       ),
